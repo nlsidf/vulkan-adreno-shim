@@ -540,3 +540,90 @@ WINEDEBUG=+font wine ac_chinese.exe 2>&1 | grep -E 'font_SelectFont|load_system_
 `proton11-init.sh` 的 `install_fonts()` 现已改为调用 `mkmsfonts_cjk.py`（Gothic 从 wqy 生成，
 自包含、无需外部 IPA 源）生成改名字体，Mincho 仍走 `mkmsfonts.py`（需 `FONT_SRC` 有 IPA）。
 这样新 prefix 也天然中文完备且不会触发 Magical Charming 递归。
+（注：16.3 第 2 步的「死链 symlink 兜底」后来证实**多此一举**——`MS Gothic` 自身已是 wqy 改名体、
+自带中文 cmap，回退链根本用不到；这些 `SIMSUN.TTC` 等软链已在糖调修复时移除，无回归。）
+
+### 16.6 另一坑：糖调（Sugar☆Full Tempering）**全部**豆腐块（`□□□□`）
+
+**游戏**：糖调！（`sugarfull-tempering`，BGI 系，`糖调！.exe`）。
+**症状**：原先中文正常，**在我们修完巧克甜恋后**突然**所有**字符变 `□`（不是部分缺，是整体）。
+巧克甜恋 / Magical Charming 不受影响。
+
+**根因（与 16.1 完全不同的路径，且第一次修法其实是错的）**：
+- 糖调**不用 `MS Gothic`**，而是直接用 **`Tahoma`** 渲染文本（`+font` trace 实锤：
+  `font_SelectFont L"Tahoma"` 出现 22000+×，`Chosen: L"Tahoma"`）。
+- Wine 自带 **bundled `tahoma.ttf`**（`Z:\proton11\proton-11\share\wine\fonts\tahoma.ttf`，
+  **只有拉丁字形**）会注册成 family `Tahoma`。所以游戏请求 `Tahoma` 时，应答的就是这个拉丁版 →
+  中文无字形 → 全 `□`。
+- **第一次错误修法**：在双 Fonts 键加 `"Tahoma (TrueType)"="wqy-microhei.ttc"`。
+  这**无效**——wqy 的内部 family name 是 `WenQuanYi Micro Hei`，所以它会归到
+  family `WenQuanYi Micro Hei`，而不是 `Tahoma`；裸名 `Tahoma` 仍命中 bundled 拉丁版。
+  （trace 实证：修了之后 family `Tahoma` 的 face 依然来自 `.../share/wine/fonts/tahoma.ttf`，
+  `Chosen: L"Tahoma"` 仍是拉丁字形 → 还是豆腐。）
+- **正确根因一句话**：要让 family `Tahoma` 真正携带中文，字体**内部名必须字面等于 `Tahoma`**
+  （与 16.1 的 MS Gothic 同理：内部名 ≠ 请求名就白白归到别的 family）。
+
+**为什么之前正常、修完巧克甜恋后才坏**：
+糖调原本靠「Wine 默认字体机制 + 某次状态」勉强出字；我们重排 Fonts 键、清缓存后，bundled 拉丁版
+`tahoma.ttf` 干净地独占了 family `Tahoma`，中文缺口暴露。本质是糖调的 Tahoma 路径从未被正确中文化。
+
+**根治（把 wqy 改名成内部名=Tahoma，再登记）**：
+```sh
+# 生成: 内部 family=Tahoma, 但 glyph 来自 wqy(中文完备)
+python3 ~/proton11/font-fix/mkmsfonts_tahoma.py
+#   -> drive_d/windows/Fonts/tahoma.ttf   (Regular, 内部名 Tahoma, 含 气/天…)
+#   -> drive_d/windows/Fonts/tahomabd.ttf (Bold,    内部名 Tahoma Bold)
+# 双 Fonts 键登记:
+"Tahoma (TrueType)"="tahoma.ttf"
+"Tahoma Bold (TrueType)"="tahomabd.ttf"
+```
+这样 family `Tahoma` 由中文完备的 wqy 改名体应答，bundled 拉丁版被同名覆盖/降级，中文不再缺字。
+`FontSubstitutes` 的 `Tahoma → WenQuanYi Micro Hei` 保留作冗余兜底。
+
+**验证（trace 实测，已通过）**：
+```sh
+WINEDEBUG=+font wine '糖调！.exe' 2>&1 | grep -E 'Adding face L"Tahoma" in family L"Tahoma" from'
+# 期望看到来源是  C:\windows\fonts\tahoma.ttf  (不再是 .../share/wine/fonts/tahoma.ttf 拉丁版)
+# 且运行期无 'notdef' / 缺字形告警 -> 中文正常
+```
+
+### 16.7 持久化补丁（糖调 Tahoma）
+`proton11-init.sh` 的 `install_fonts()` 现在：
+1. 字体缺失检测列表追加 `tahoma.ttf` / `tahomabd.ttf`；
+2. 生成阶段调用 `mkmsfonts_tahoma.py`（与 `mkmsfonts_cjk.py` 同理，把 wqy 改名成内部名 `Tahoma`）；
+3. `TARGETS` 追加 `("Tahoma","tahoma.ttf","TrueType")` 与 `("Tahoma Bold","tahomabd.ttf","TrueType")`，
+   随 6 个改名字体一起写进**双 Fonts 键**，幂等、重跑不重复。
+（注意：第一次写的 `wqy-microhei.ttc` 是错的，已改为 `tahoma.ttf`/`tahomabd.ttf`。）
+
+### 16.8 广覆盖（自动兜底更多东亚/中文字体名）
+
+**动机**：上面每款游戏都要单独追字体名太累。目标是「大部分新 AVG / 国产游戏不用再单独调」。
+
+**关键认知（省钱省事）**：
+- Wine **只 bundled 了 `tahoma.ttf` / `tahomabd.ttf` 这两个拉丁字体**会阴影同名请求；
+  其它东亚字体名（Yu Gothic / Meiryo / Microsoft YaHei / SimSun / Malgun / MingLiU / Segoe UI …）
+  **没有 bundled 阴影**，所以只要 `FontSubstitutes` 里把它们映射到 `WenQuanYi Micro Hei`
+  （wqy 是中文完备真实字体），请求这些名就会落到 wqy → 中文正常。**这一步注册表默认已做了大半**
+  （Arial/Courier/Meiryo/Yu Gothic/Microsoft YaHei/SimSun/SimHei/Segoe UI/NSimSun… 早已 →WenQuanYi）。
+- 真正需要**真实改名文件**（内部名必须 == 请求名）的只有：被阴影的 Tahoma 系，以及
+  想「内部名精确匹配」保万无一失的常见名。
+
+**做法（两层互补）**：
+1. **真实改名文件**（子弹穿甲，内部名精确匹配）：`mkmsfonts_more.py` 把 wqy 改名成
+   14 个常见家族名写入 `Fonts/`：`Yu Gothic`/`Yu Gothic UI`/`Meiryo`/`Meiryo UI`/
+   `Malgun Gothic`/`Microsoft YaHei`/`Microsoft YaHei UI`/`SimSun`/`SimHei`/`MingLiU`/
+   `PMingLiU`/`Microsoft JhengHei`/`Microsoft JhengHei UI`/`Segoe UI`。
+   Wine 扫 `Fonts/` 目录自动登记，family 名即这些名 → 直接中文完备。
+   （只做 Regular；粗体由 Wine 对 TTF 轮廓合成 faux-bold，wqy 是 TTF，可用。）
+2. **FontSubstitutes 兜底**（便宜、注册表级）：`proton11-init.sh` 的 `install_fonts()` 在
+   `FontSubstitutes` 节**追加**一大票东亚/中文字体名 → `WenQuanYi Micro Hei`
+   （韩文 Gulim/Batang/Gungsuh 系；日文 Yu Mincho/Hiragino 系；简体 KaiTi/FangSong/ST*/FZ* 等；
+   繁体 DFKai-SB/KaiU/MingLiU_HKSCS；字重变体 Microsoft YaHei Light；以及上面 14 个文件的 UI 变体双保险）。
+   已存在则跳过，**幂等**。覆盖到名字即中文化，无需再为每个游戏单独改。
+
+**代价**：`Fonts/` 下多了 14 个约 4.6MB 的 CJK 字体，Wine 每次启动都会加载 → 字体初始化略慢
+（一次性，不影响运行帧率）。磁盘充裕（122G 可用）可接受。
+
+**仍不自动覆盖的情况**：请求名既不在 14 个真实文件里、又没被 FontSubstitutes 列到的冷门字体名
+（如极偏的厂商私有字体）→ 仍可能豆腐。遇到就照 §16.6 的套路加一条改名文件或替换项即可。
+

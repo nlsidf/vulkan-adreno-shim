@@ -246,7 +246,7 @@ install_fonts() {
 
     # --- 1. 字体文件缺失则尝试从源字体生成 (需 FONT_SRC 含 IPA 提取目录 + Noto CJK ttc) ---
     local missing=0
-    for f in SourceHanSansSC-Bold.otf msgothic.ttf msgothicp.ttf msuigothic.ttf msmincho.ttf msminchop.ttf; do
+    for f in SourceHanSansSC-Bold.otf msgothic.ttf msgothicp.ttf msuigothic.ttf msmincho.ttf msminchop.ttf tahoma.ttf tahomabd.ttf yugothic.ttf yugothui.ttf meiryo.ttf meiryoui.ttf malgun.ttf msyh.ttf msyhui.ttf simsun.ttf simhei.ttf mingliu.ttf pmingliu.ttf msjh.ttf msjhui.ttf segoeui.ttf; do
         [ -f "$FONTDIR/$f" ] || missing=1
     done
     if [ "$missing" -eq 1 ]; then
@@ -255,6 +255,11 @@ install_fonts() {
             # Gothic 系列从 wqy (CJK 完备, 中文不缺字) 改名; Mincho 系列从 IPA 生成
             python3 "$FONT_FIX/mkmsfonts_cjk.py" 2>&1 | tail -5 || warn "mkmsfonts_cjk.py 失败"
             python3 "$FONT_FIX/mkmsfonts.py" 2>&1 | tail -5 || warn "mkmsfonts.py 失败 (检查 $FONT_SRC 布局)"
+            # Tahoma 系列从 wqy 改名成内部名=Tahoma (中文完备, 让 family Tahoma 带 CJK 字形)
+            python3 "$FONT_FIX/mkmsfonts_tahoma.py" 2>&1 | tail -5 || warn "mkmsfonts_tahoma.py 失败"
+            # 广覆盖: 把 wqy 改名成一大批常见 CJK 家族名(Yu Gothic/Meiryo/Microsoft YaHei/
+            # SimSun/Malgun/MingLiU/Segoe UI ...), 仅依赖 wqy, 无需 FONT_SRC
+            python3 "$FONT_FIX/mkmsfonts_more.py" 2>&1 | tail -5 || warn "mkmsfonts_more.py 失败"
             local ttc
             ttc=$(ls "$FONT_SRC"/NotoSansCJK*.ttc 2>/dev/null | head -1)
             if [ -n "$ttc" ]; then
@@ -285,6 +290,13 @@ TARGETS = [
     ("MS Mincho",            "msmincho.ttf",          "TrueType", False),
     ("MS PMincho",           "msminchop.ttf",         "TrueType", False),
     ("SourceHanSansSC-Bold", "SourceHanSansSC-Bold.otf", "OpenType", True),
+    # 糖调(Sugar☆Full Tempering) 等 BGI 游戏直接用 Tahoma 渲染中文.
+    # 关键: Wine 自带 bundled tahoma.ttf 只有拉丁字形 -> 中文全豆腐.
+    # 必须把 wqy 改名成内部名=Tahoma 的 tahoma.ttf(既中文完备, 又让 family "Tahoma"
+    # 真正携带 CJK 字形), 再登记到 Fonts 键. 直接 "Tahoma (TrueType)"="wqy-microhei.ttc"
+    # 无效——wqy 内部名是 WenQuanYi, 会归到别的 family, 裸名 Tahoma 仍命中 bundled 拉丁版.
+    ("Tahoma",               "tahoma.ttf",            "TrueType", False),
+    ("Tahoma Bold",          "tahomabd.ttf",          "TrueType", False),
 ]
 FONTS_KEYS = [
     r'[Software\\Microsoft\\Windows\\CurrentVersion\\Fonts]',
@@ -292,6 +304,28 @@ FONTS_KEYS = [
 ]
 SUB_KEY = r'[Software\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes]'
 KILL_SUB = {"MS Gothic", "MS PGothic", "MS UI Gothic", "MS Mincho", "MS PMincho"}
+# 广覆盖: 常见东亚/中文字体名 -> WenQuanYi Micro Hei (中文完备). 这些名多数没有 bundled
+# 阴影字体, 用 FontSubstitutes 替换即可兜底; 少数已生成真实改名文件者(见下)替换不触发也无妨.
+# 注意: 绝不列符号字体(marlett/symbol/webdings/wingdings)与纯拉丁字体(arial/times...),
+# 那些改掉会破坏 UI 布局/符号——默认注册表已把 arial/courier 等映射到 WenQuanYi, 这里不动.
+EXTRA_SUB = [
+    # 韩文
+    "Gulim","GulimChe","Batang","BatangChe","Gungsuh","GungsuhChe",
+    # 日文衬线 / macOS 系
+    "Yu Mincho","Yu Mincho Light","Hiragino Kaku Gothic Pro","Hiragino Kaku Gothic ProN",
+    "Hiragino Sans","Hiragino Mincho ProN","Hiragino Sans GB","Hiragino Sans CNS",
+    # 简体中文(书法/方正/华文等)
+    "KaiTi","KaiTi_GB2312","FangSong","FangSong_GB2312","LiSu","YouYuan","DengXian",
+    "STSong","STHeiti","STKaiti","STXingkai","STLiti","STZhongsong","STFangsong",
+    "STXihei","STXinwei","STKaitiSC","STSongtiSC","STYuanti","FZShuTi","FZKai-Z03",
+    # 繁体中文
+    "DFKai-SB","KaiU","MingLiU_HKSCS","PMingLiU_HKSCS",
+    # 字重变体
+    "Microsoft YaHei Light",
+    # 已生成真实改名文件的 UI 变体(双保险)
+    "Yu Gothic UI","Meiryo UI","Malgun Gothic","Microsoft YaHei UI",
+    "MingLiU","PMingLiU","Microsoft JhengHei","Microsoft JhengHei UI",
+]
 # 完整值键名集合 (值键形如 "MS Gothic (TrueType)"), 用于去重
 KEYS = {f"{disp} ({suffix})" for (disp, _f, suffix, _o) in TARGETS}
 
@@ -350,6 +384,15 @@ if SUB_KEY in sec:
             continue
         newbody.append(ln)
     sec[SUB_KEY] = newbody
+# ---- 广覆盖: 追加 EXTRA_SUB -> WenQuanYi Micro Hei (已存在则跳过, 幂等) ----
+if SUB_KEY in sec:
+    have = set()
+    for ln in sec[SUB_KEY]:
+        m = re.match(r'"([^"]+)"=', ln.rstrip("\r\n"))
+        if m: have.add(m.group(1))
+    for name in EXTRA_SUB:
+        if name not in have:
+            sec[SUB_KEY].append('"%s"="WenQuanYi Micro Hei"\n' % name)
 write(reg, dump(sec, order))
 
 # ---- user.reg: 清除 Wine 字体缓存节, 强制重扫 Fonts 目录 ----
@@ -362,13 +405,13 @@ PY
 
     # --- 3. 校验 ---
     local ok=0
-    for f in SourceHanSansSC-Bold.otf msgothic.ttf msgothicp.ttf msuigothic.ttf msmincho.ttf msminchop.ttf; do
+    for f in SourceHanSansSC-Bold.otf msgothic.ttf msgothicp.ttf msuigothic.ttf msmincho.ttf msminchop.ttf tahoma.ttf tahomabd.ttf yugothic.ttf yugothui.ttf meiryo.ttf meiryoui.ttf malgun.ttf msyh.ttf msyhui.ttf simsun.ttf simhei.ttf mingliu.ttf pmingliu.ttf msjh.ttf msjhui.ttf segoeui.ttf; do
         [ -f "$FONTDIR/$f" ] && ok=$((ok+1))
     done
-    if [ "$ok" -eq 6 ]; then
-        log "字体文件 6/6 就位; 注册表登记完成"
+    if [ "$ok" -eq 22 ]; then
+        log "字体文件 22/22 就位; 注册表登记完成"
     else
-        warn "字体文件仅 $ok/6 就位 (若缺源字体需先准备 FONT_SRC)"
+        warn "字体文件仅 $ok/22 就位 (若缺源字体需先准备 FONT_SRC)"
     fi
 }
 main() {
