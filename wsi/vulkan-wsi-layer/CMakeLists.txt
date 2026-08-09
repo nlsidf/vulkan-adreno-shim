@@ -1,0 +1,400 @@
+# Copyright (c) 2019-2025 Arm Limited.
+#
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+cmake_minimum_required(VERSION 3.4.3)
+project(VkLayer_window_system_integration)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(VULKAN_PKG_CONFIG vulkan)
+
+find_program(CLANG_TIDY clang-tidy-8)
+
+if (NOT CLANG_TIDY STREQUAL "CLANG_TIDY-NOTFOUND")
+   message(STATUS "Using clang-tidy: ${CLANG_TIDY}")
+   set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY} -checks=bugprone-*,modernize-*)
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Werror -Wextra -pthread -fPIC")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+
+if(NOT DEFINED VULKAN_CXX_INCLUDE)
+   set(VULKAN_CXX_INCLUDE ${VULKAN_PKG_CONFIG_INCLUDEDIR})
+endif()
+
+if(DEFINED VULKAN_CXX_INCLUDE)
+   message(STATUS "Using Vulkan include directories: ${VULKAN_CXX_INCLUDE}")
+   separate_arguments(VULKAN_CXX_INCLUDE)
+else()
+   message(FATAL_ERROR "Either vulkan.pc must be available or VULKAN_CXX_INCLUDE must be defined")
+endif()
+
+# Build Configuration options
+
+# Backend support
+option(BUILD_WSI_HEADLESS "Build with support for VK_EXT_headless_surface" OFF)
+option(BUILD_WSI_X11 "Build with support for VK_KHR_xcb_surface" ON)
+option(BUILD_WSI_WAYLAND "Build with support for VK_KHR_wayland_surface" ON)
+option(BUILD_WSI_DISPLAY "Build with support for VK_KHR_display" OFF)
+
+set(SELECT_EXTERNAL_ALLOCATOR "dma_buf_heaps" CACHE STRING "Select an external system allocator (none, ion, dma_buf_heaps)")
+set(EXTERNAL_WSIALLOC_LIBRARY "" CACHE STRING "External implementation of the wsialloc interface to use")
+set(WSIALLOC_MEMORY_HEAP_NAME "system-uncached" CACHE STRING "Heap name used by the dma_buf_heaps allocator")
+
+# Optional features
+option(BUILD_WSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS "Build with support for format modifiers in VK_KHR_display" ON)
+option(VULKAN_WSI_LAYER_EXPERIMENTAL "Enable the Vulkan WSI Experimental features" OFF)
+option(ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD "Enable the non-conformant FIFO presentation thread implementation in the Wayland backend" ON)
+
+# Enables the layer to pass frame boundary events if the ICD or layers below have support for it by
+# making use of the VK_EXT_frame_boundary extension. If the application itself makes use of the
+# VK_EXT_frame_boundary then the layer will not pass its own frame boundary events.
+option(ENABLE_INSTRUMENTATION "Pass frame boundary events by using VK_EXT_frame_boundary" OFF)
+
+if(BUILD_WSI_WAYLAND OR BUILD_WSI_DISPLAY OR BUILD_WSI_X11)
+   set(BUILD_DRM_UTILS true)
+   if(SELECT_EXTERNAL_ALLOCATOR STREQUAL "none")
+      message(FATAL_ERROR "WSI only supported with an external allocator.")
+   endif()
+endif()
+
+if(BUILD_DRM_UTILS)
+   add_library(drm_utils STATIC util/drm/drm_utils.cpp)
+
+   pkg_check_modules(LIBDRM REQUIRED libdrm)
+   message(STATUS "Using libdrm include directories: ${LIBDRM_INCLUDE_DIRS}")
+   message(STATUS "Using libdrm cflags: ${LIBDRM_CFLAGS}")
+
+   target_sources(drm_utils PRIVATE util/drm/format_table.c)
+   target_include_directories(drm_utils PRIVATE ${VULKAN_CXX_INCLUDE})
+   target_include_directories(drm_utils PUBLIC ${LIBDRM_INCLUDE_DIRS})
+   target_include_directories(drm_utils PUBLIC util/wsialloc)
+   target_compile_options(drm_utils PUBLIC ${LIBDRM_CFLAGS})
+endif()
+
+# External WSI Allocator
+if(NOT SELECT_EXTERNAL_ALLOCATOR STREQUAL "none" AND EXTERNAL_WSIALLOC_LIBRARY STREQUAL "")
+   add_library(wsialloc STATIC)
+   set_target_properties(wsialloc PROPERTIES C_STANDARD 99)
+
+   if(SELECT_EXTERNAL_ALLOCATOR STREQUAL "ion")
+      target_sources(wsialloc PRIVATE util/wsialloc/wsialloc_ion.c util/wsialloc/wsialloc_helpers.c)
+      target_link_libraries(wsialloc drm_utils)
+      if(DEFINED KERNEL_HEADER_DIR)
+         target_include_directories(wsialloc PRIVATE "${KERNEL_HEADER_DIR}")
+      else()
+         message(FATAL_ERROR "KERNEL_HEADER_DIR must be defined as the directory that includes the kernel headers.")
+      endif()
+   elseif(SELECT_EXTERNAL_ALLOCATOR STREQUAL "dma_buf_heaps")
+      target_sources(wsialloc PRIVATE util/wsialloc/wsialloc_dma_buf_heaps.c util/wsialloc/wsialloc_helpers.c)
+      target_link_libraries(wsialloc drm_utils)
+      add_definitions(-Ulinux -DWSIALLOC_MEMORY_HEAP_NAME=${WSIALLOC_MEMORY_HEAP_NAME})
+   else()
+      message(FATAL_ERROR "Invalid external allocator selected: ${SELECT_EXTERNAL_ALLOCATOR}")
+   endif()
+
+   target_include_directories(wsialloc PRIVATE ${VULKAN_CXX_INCLUDE})
+   target_include_directories(wsialloc PRIVATE util/drm)
+   target_include_directories(wsialloc PRIVATE util/)
+endif()
+
+# Wayland WSI
+if(BUILD_WSI_WAYLAND)
+   add_library(wayland_wsi STATIC
+      wsi/wayland/surface_properties.cpp
+      wsi/wayland/surface.cpp
+      wsi/wayland/wl_helpers.cpp
+      wsi/wayland/swapchain.cpp)
+
+   if(VULKAN_WSI_LAYER_EXPERIMENTAL)
+      target_sources(wayland_wsi PRIVATE wsi/wayland/present_timing_handler.cpp)
+   endif()
+
+   pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+   message(STATUS "Using Wayland client include directories: ${WAYLAND_CLIENT_INCLUDE_DIRS}")
+   message(STATUS "Using Wayland client cflags: ${WAYLAND_CLIENT_CFLAGS}")
+   message(STATUS "Using Wayland client ldflags: ${WAYLAND_CLIENT_LDFLAGS}")
+
+   find_program(WAYLAND_SCANNER_EXEC wayland-scanner REQUIRED)
+   message(STATUS "Using wayland-scanner : ${WAYLAND_SCANNER_EXEC}")
+
+   pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
+   pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+   message(STATUS "Using wayland protocols dir : ${WAYLAND_PROTOCOLS_DIR}")
+
+   add_custom_target(wayland_generated_files
+      COMMAND ${WAYLAND_SCANNER_EXEC} client-header
+      ${WAYLAND_PROTOCOLS_DIR}/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_EXEC} public-code
+      ${WAYLAND_PROTOCOLS_DIR}/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-protocol.c
+      COMMAND ${WAYLAND_SCANNER_EXEC} client-header
+      ${WAYLAND_PROTOCOLS_DIR}/unstable/linux-explicit-synchronization/linux-explicit-synchronization-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-explicit-synchronization-unstable-v1-protocol.h
+      COMMAND ${WAYLAND_SCANNER_EXEC} public-code
+      ${WAYLAND_PROTOCOLS_DIR}/unstable/linux-explicit-synchronization/linux-explicit-synchronization-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-explicit-synchronization-unstable-v1-protocol.c
+      COMMAND ${WAYLAND_SCANNER_EXEC} client-header
+      ${WAYLAND_PROTOCOLS_DIR}/stable/presentation-time/presentation-time.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/presentation-time-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_EXEC} public-code
+      ${WAYLAND_PROTOCOLS_DIR}/stable/presentation-time/presentation-time.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/presentation-time-client-protocol.c
+      BYPRODUCTS linux-dmabuf-unstable-v1-protocol.c linux-dmabuf-unstable-v1-client-protocol.h
+                 linux-explicit-synchronization-unstable-v1-protocol.c linux-explicit-synchronization-unstable-v1-protocol.h
+                 presentation-time-client-protocol.c presentation-time-client-protocol.h)
+
+   target_sources(wayland_wsi PRIVATE
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-client-protocol.h
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-explicit-synchronization-unstable-v1-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-explicit-synchronization-unstable-v1-protocol.h
+      ${CMAKE_CURRENT_BINARY_DIR}/presentation-time-client-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/presentation-time-client-protocol.h)
+   add_dependencies(wayland_wsi wayland_generated_files)
+
+   target_include_directories(wayland_wsi PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${VULKAN_CXX_INCLUDE}
+      ${WAYLAND_CLIENT_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_BINARY_DIR})
+
+   target_compile_options(wayland_wsi PRIVATE ${WAYLAND_CLIENT_CFLAGS})
+   target_compile_options(wayland_wsi INTERFACE "-DBUILD_WSI_WAYLAND=1")
+   if(NOT EXTERNAL_WSIALLOC_LIBRARY STREQUAL "")
+      target_link_libraries(wayland_wsi ${EXTERNAL_WSIALLOC_LIBRARY})
+   else()
+      target_link_libraries(wayland_wsi wsialloc)
+   endif()
+   target_link_libraries(wayland_wsi drm_utils ${WAYLAND_CLIENT_LDFLAGS})
+   list(APPEND LINK_WSI_LIBS wayland_wsi)
+   if(ENABLE_WAYLAND_FIFO_PRESENTATION_THREAD)
+      target_compile_definitions(wayland_wsi PRIVATE "-DWAYLAND_FIFO_PRESENTATION_THREAD_ENABLED=1")
+   else()
+      target_compile_definitions(wayland_wsi PRIVATE "-DWAYLAND_FIFO_PRESENTATION_THREAD_ENABLED=0")
+   endif()
+else()
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_wayland_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+endif()
+
+# Headless
+if(BUILD_WSI_HEADLESS)
+   add_library(wsi_headless STATIC
+      wsi/headless/surface_properties.cpp
+      wsi/headless/surface.cpp
+      wsi/headless/swapchain.cpp)
+
+   if(VULKAN_WSI_LAYER_EXPERIMENTAL)
+      target_sources(wsi_headless PRIVATE wsi/headless/present_timing_handler.cpp)
+   endif()
+
+   target_include_directories(wsi_headless PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${VULKAN_CXX_INCLUDE}
+      ${CMAKE_CURRENT_BINARY_DIR})
+
+   target_compile_options(wsi_headless INTERFACE "-DBUILD_WSI_HEADLESS=1")
+   list(APPEND LINK_WSI_LIBS wsi_headless)
+else()
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_headless_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_shared_presentable_image/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+endif()
+
+# Display
+if (BUILD_WSI_DISPLAY)
+   add_library(wsi_display STATIC
+      wsi/display/drm_display.cpp
+      wsi/display/surface_properties.cpp
+      wsi/display/swapchain.cpp
+      wsi/display/surface.cpp)
+
+   pkg_check_modules(LIBDRM REQUIRED libdrm)
+   message(STATUS "Using libdrm include directories: ${LIBDRM_INCLUDE_DIRS}")
+   message(STATUS "Using libdrm ldflags: ${LIBDRM_LDFLAGS}")
+
+   target_include_directories(wsi_display PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${VULKAN_CXX_INCLUDE}
+      ${CMAKE_CURRENT_BINARY_DIR})
+
+   target_include_directories(wsi_display PUBLIC
+      ${LIBDRM_INCLUDE_DIRS})
+
+   target_compile_options(wsi_display INTERFACE "-DBUILD_WSI_DISPLAY=1")
+   target_link_libraries(wsi_display ${LIBDRM_LDFLAGS} drm)
+   target_link_libraries(wsi_display drm_utils)
+   if(NOT EXTERNAL_WSIALLOC_LIBRARY STREQUAL "")
+      target_link_libraries(wsi_display ${EXTERNAL_WSIALLOC_LIBRARY})
+   else()
+      target_link_libraries(wsi_display wsialloc)
+   endif()
+   list(APPEND LINK_WSI_LIBS wsi_display)
+else()
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_display/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+endif()
+
+# X11 WSI
+if(BUILD_WSI_X11)
+   set(CMAKE_BUILD_TYPE "Debug")
+
+   # Generate xdg-shell protocol for Xwayland bypass
+   pkg_check_modules(WAYLAND_CLIENT_X11 wayland-client)
+   find_program(WAYLAND_SCANNER_X11 wayland-scanner REQUIRED)
+   pkg_check_modules(WAYLAND_PROTOCOLS_X11 wayland-protocols)
+   pkg_get_variable(WAYLAND_PROTOCOLS_DIR_X11 wayland-protocols pkgdatadir)
+
+   add_custom_target(x11_wayland_generated_files
+      COMMAND ${WAYLAND_SCANNER_X11} client-header
+      ${WAYLAND_PROTOCOLS_DIR_X11}/stable/xdg-shell/xdg-shell.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_X11} public-code
+      ${WAYLAND_PROTOCOLS_DIR_X11}/stable/xdg-shell/xdg-shell.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c
+      COMMAND ${WAYLAND_SCANNER_X11} client-header
+      ${WAYLAND_PROTOCOLS_DIR_X11}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-unstable-v1-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_X11} public-code
+      ${WAYLAND_PROTOCOLS_DIR_X11}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-unstable-v1-protocol.c
+      COMMAND ${WAYLAND_SCANNER_X11} client-header
+      ${WAYLAND_PROTOCOLS_DIR_X11}/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_X11} public-code
+      ${WAYLAND_PROTOCOLS_DIR_X11}/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-protocol.c
+      BYPRODUCTS xdg-shell-client-protocol.h xdg-shell-protocol.c
+         xdg-decoration-unstable-v1-client-protocol.h xdg-decoration-unstable-v1-protocol.c
+         linux-dmabuf-unstable-v1-client-protocol.h linux-dmabuf-unstable-v1-protocol.c)
+
+   add_library(wsi_x11 STATIC
+      wsi/x11/drm_display.cpp
+      wsi/x11/surface_properties.cpp
+      wsi/x11/surface.cpp
+      wsi/x11/swapchain.cpp
+      wsi/x11/shm_presenter.cpp
+      wsi/x11/dri3_presenter.cpp
+      wsi/x11/wayland_bypass.cpp
+      ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-unstable-v1-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/linux-dmabuf-unstable-v1-protocol.c)
+   add_dependencies(wsi_x11 x11_wayland_generated_files)
+
+   pkg_check_modules(LIBDRM REQUIRED libdrm)
+   message(STATUS "Using libdrm include directories: ${LIBDRM_INCLUDE_DIRS}")
+   message(STATUS "Using libdrm ldflags: ${LIBDRM_LDFLAGS}")
+
+   target_include_directories(wsi_x11 PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${VULKAN_CXX_INCLUDE}
+      ${CMAKE_CURRENT_BINARY_DIR})
+
+   target_include_directories(wsi_x11 PUBLIC
+      ${LIBDRM_INCLUDE_DIRS})
+
+   target_compile_options(wsi_x11 INTERFACE "-DBUILD_WSI_X11=1")
+   
+   if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+      option(ENABLE_ARM_NEON "Enable ARM NEON optimizations for X11 SHM" ON)
+      if(ENABLE_ARM_NEON)
+         target_compile_definitions(wsi_x11 PRIVATE "ENABLE_ARM_NEON=1")
+         target_compile_options(wsi_x11 PRIVATE "-march=armv8-a+simd")
+         message(STATUS "Enabled ARM NEON optimizations for X11 SHM presentation")
+      endif()
+   else()
+      message(STATUS "No SIMD optimizations available for architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+   endif()
+   
+   target_link_libraries(wsi_x11 ${LIBDRM_LDFLAGS} drm)
+   target_link_libraries(wsi_x11 drm_utils)
+   if(NOT EXTERNAL_WSIALLOC_LIBRARY STREQUAL "")
+      target_link_libraries(wsi_x11 ${EXTERNAL_WSIALLOC_LIBRARY})
+   else()
+      target_link_libraries(wsi_x11 wsialloc)
+   endif()
+   target_link_libraries(wsi_x11 ${WAYLAND_CLIENT_X11_LDFLAGS})
+   list(APPEND LINK_WSI_LIBS wsi_x11 xcb xcb-shm xcb-sync xcb-dri3 xcb-present X11-xcb X11 Xrandr wayland-client)
+else()
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_xcb_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_xlib_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+endif()
+
+# Layer
+add_library(${PROJECT_NAME} SHARED
+   layer/layer.cpp
+   layer/private_data.cpp
+   layer/surface_api.cpp
+   layer/swapchain_api.cpp
+   layer/swapchain_maintenance_api.cpp
+   util/timed_semaphore.cpp
+   util/custom_allocator.cpp
+   util/extension_list.cpp
+   util/log.cpp
+   util/format_modifiers.cpp
+   wsi/external_memory.cpp
+   wsi/extensions/image_compression_control.cpp
+   wsi/extensions/present_id.cpp
+   wsi/extensions/frame_boundary.cpp
+   wsi/extensions/wsi_extension.cpp
+   wsi/extensions/swapchain_maintenance.cpp
+   wsi/surface_properties.cpp
+   wsi/swapchain_base.cpp
+   wsi/synchronization.cpp
+   wsi/wsi_factory.cpp)
+if (VULKAN_WSI_LAYER_EXPERIMENTAL)
+   target_sources(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/layer/present_timing_api.cpp)
+   target_sources(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/wsi/extensions/present_timing.cpp)
+   add_definitions("-DVULKAN_WSI_LAYER_EXPERIMENTAL=1")
+else()
+   list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_EXT_present_timing/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+   add_definitions("-DVULKAN_WSI_LAYER_EXPERIMENTAL=0")
+endif()
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE ${WSI_DEFINES})
+target_include_directories(${PROJECT_NAME} PRIVATE
+        ${PROJECT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${VULKAN_CXX_INCLUDE})
+
+if (BUILD_WSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS)
+   add_definitions("-DWSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS=1")
+else()
+   add_definitions("-DWSI_DISPLAY_SUPPORT_FORMAT_MODIFIERS=0")
+endif()
+
+if(ENABLE_INSTRUMENTATION)
+   add_definitions("-DENABLE_INSTRUMENTATION=1")
+else()
+   add_definitions("-DENABLE_INSTRUMENTATION=0")
+endif()
+
+target_link_libraries(${PROJECT_NAME} ${LINK_WSI_LIBS})
+
+add_custom_target(manifest_json ALL COMMAND
+   cp ${PROJECT_SOURCE_DIR}/layer/VkLayer_window_system_integration.json ${CMAKE_CURRENT_BINARY_DIR}
+   ${JSON_COMMANDS})
+
+install(TARGETS ${PROJECT_NAME} DESTINATION share/vulkan/implicit_layer.d/)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json DESTINATION share/vulkan/implicit_layer.d/)
