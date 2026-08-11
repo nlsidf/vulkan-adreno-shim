@@ -37,7 +37,7 @@ VK_EXT_external_memory_host Adreno 540 驱动不支持该扩展
 
 · Galgame（如 9-nine）：在骁龙 835 上稳定 60 FPS。
 · 性能损耗：仅 vkMapMemory 时增加一次 mmap 系统调用（微秒级），运行时零额外开销。
-· 兼容性：已测试 9-nine、Mashiroiro Symphony SANA、Skyrail 等多款 32/64 位游戏。
+· 兼容性：已测试 9-nine、Mashiroiro Symphony SANA、Skyrail 等多款 32/64 位游戏；**纯 D3D7 游戏（如 KiriKiri 的 Nagaruboshi）经 `d3d7to9/` 补充方案亦可跑**（见下）。
 
 ---
 
@@ -65,7 +65,13 @@ vulkan-adreno-shim/
 │   ├── t_shimlow.c               # 端到端 shim 模拟测试
 │   └── ...                       # 其他探测/调试工具
 ├── docs/
-│   └── adreno32.md               # 完整技术文档（含根因分析、失败路径、实现细节）
+│   ├── adreno32.md               # 完整技术文档（含根因分析、失败路径、实现细节）
+│   └── d3d7to9.md                # 补充：D3D7/DirectDraw 游戏经 D3D7to9→DXVK 在 Adreno 跑通
+├── d3d7to9/                      # 补充：D3D7→D3D9 翻译层（elishacloud/DXWrapper）部署件套
+│   ├── ddraw.dll                 # D3D7to9 本体（32-bit）
+│   ├── dxwrapper.dll             # DXWrapper 引擎（32-bit，被 ddraw.dll 加载）
+│   ├── dxwrapper.ini             # 配置（Dd7to9=1，RealDllPath 指向 ddraw_wine.dll）
+│   └── README.md                 # 快速部署说明
 └── archive/                      # 非核心测试/日志/备份（压缩存档）
     └── extra_files.7z
 ```
@@ -134,6 +140,8 @@ info:  Presenter: Actual swap chain properties: Format: ... Buffer size: 960x540
 📖 进阶文档
 
 · docs/adreno32.md – 包含完整的根因分析、所有失败路径记录、shim 实现细节、调试技巧。
+· docs/d3d7to9.md – 补充：纯 D3D7 / DirectDraw 7 游戏（如 KiriKiri Galgame）为何在 Adreno 上起不来、如何用 D3D7to9 在 prefix 层翻译成 D3D9 复用 DXVK 路径跑通（Shim 无需改动）。
+· d3d7to9/ – 上述方案的即用部署件套（D3D7to9 + DXWrapper 引擎 + 配置）。
 · tests/ – 独立的测试程序可用于验证 dmabuf 导出、内存类型兼容性、shim 端到端行为。
 
 ---
