@@ -41,6 +41,26 @@ VK_EXT_external_memory_host Adreno 540 驱动不支持该扩展
 
 ---
 
+## 🪞 深度格式修复（D32_SFLOAT_S8_UINT → D24_UNORM_S8_UINT）
+
+某些 Unity / D3D11 游戏（如 SPECIMEN: HIDE & SEEK）在 Adreno 540 上表现为：**画面灰屏/黑屏 → 修好后可见但带贴图表面持续闪烁**。
+
+根因链条：
+
+1. Adreno 540 的 HAL 把 `D32_SFLOAT_S8_UINT`(130) 在 `vkGetPhysicalDeviceFormatProperties` / `ImageFormatProperties` 中报成**零特性、彻底不支持**（`VK_ERROR_FORMAT_NOT_SUPPORTED`），而 `D24_UNORM_S8_UINT`(129) 是硬件真正支持的深度格式。
+2. DXVK 在启动期用不同 usage 探测深度格式，只要 `SAMPLED` 这一次返回失败，就把该格式整体标记为不支持并缓存 → 之后每次 `RenderTexture.Create` 都直接失败（SPECIMEN 实测 5594 次），场景无法渲染。
+3. 仅「谎称 D32S8 可用」会让场景显示出来，但硬件**实际不能正确渲染 D32S8** → 深度缓冲是坏的 → 带贴图表面 z-fighting 闪烁。
+
+修复（实现于 `icd/vulkan_adreno_icd.c`）：对 `D32_SFLOAT_S8_UINT` 做**透明替换**为 `D24_UNORM_S8_UINT`，且 `vkCreateImage` / `vkCreateImageView` / `vkCreateRenderPass(2)` **三处一致替换**，避免格式不匹配报错。另含 `VK_TEST_RAW=1` 开关，可在不修补的情况下直连硬件验证。
+
+证据（详见 `docs/adreno-depth.md`）：
+- `qfmt`（RAW 查询）：D32S8 的 `FormatProperties.optimal = 0x0`、ImageFormatProperties 返回 -11；D24S8 正常。
+- `depthtest`（功能渲染）：D24S8 渲染中心像素为绿（深度正确）；D32S8 直接令驱动段错误（不可用）。
+
+> 注意：本问题已永久修好。老 Adreno 540 的其他能力缺口（BC 压缩、可选颜色格式等）若在未来别的游戏出现，用同样的「抓日志 → RAW 查询 → 等价替换」流程即可（见 `docs/adreno-depth.md` 第四节）。
+
+---
+
 📁 项目结构
 
 ```
@@ -63,9 +83,13 @@ vulkan-adreno-shim/
 │   ├── t_extfd2.c                # dmabuf 基础导出测试
 │   ├── t_extfd4.c                # 内存类型矩阵测试
 │   ├── t_shimlow.c               # 端到端 shim 模拟测试
-│   └── ...                       # 其他探测/调试工具
+│   ├── qfmt.c                    # 直连 HAL 查询深度格式原始能力（配合 VK_TEST_RAW=1）
+│   ├── depthtest.c               # 真实深度测试渲染，验证 D32S8/D24S8 是否可用
+│   ├── depthtest.vert/.frag      # 上述测试的着色器（已编译为 .spv）
+│   └── README.md                 # 测试编译/运行说明
 ├── docs/
 │   ├── adreno32.md               # 完整技术文档（含根因分析、失败路径、实现细节）
+│   ├── adreno-depth.md            # 深度格式 D32S8→D24S8 修复完整记录与未来指导
 │   └── d3d7to9.md                # 补充：D3D7/DirectDraw 游戏经 D3D7to9→DXVK 在 Adreno 跑通
 ├── d3d7to9/                      # 补充：D3D7→D3D9 翻译层（elishacloud/DXWrapper）部署件套
 │   ├── ddraw.dll                 # D3D7to9 本体（32-bit）

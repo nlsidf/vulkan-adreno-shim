@@ -63,6 +63,10 @@ static VkInstance           g_real_icd_instance    = NULL; /* 真实驱动的实
  */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* 测试开关: 设 VK_TEST_RAW=1 时, 本 shim 不做任何 D32S8 修复/替换,
+ * 让测试程序能观察 Adreno 硬件对 D32S8 的真实行为。默认关闭, 不影响游戏。 */
+static int g_raw_test = 0;
+
 #define MAX_INST 16
 #define MAX_PD   32
 typedef struct { VkInstance inst; PFN_vkGetPhysicalDeviceImageFormatProperties iffp; PFN_vkGetPhysicalDeviceFormatProperties fmtp; } InstEntry;
@@ -315,6 +319,8 @@ static VkResult VKAPI_CALL shim_vkEnumeratePhysicalDevices(VkInstance instance,
     return r;
 }
 
+static int fmt_is_bc(VkFormat f); /* 前向声明, 定义在 fmtp 修正区 */
+
 /* ---- vkGetPhysicalDeviceImageFormatProperties 深度格式修正 ----
  * Adreno 540 HAL 对深度/模板格式的 imageFormatProperties 查询总是返回
  * VK_ERROR_FORMAT_NOT_SUPPORTED (-11), 连 D16_UNORM 都失败 (实测 imgfmt_probe),
@@ -337,12 +343,6 @@ static int fmt_is_depth_stencil(VkFormat format) {
         case VK_FORMAT_D16_UNORM_S8_UINT:
         case VK_FORMAT_D24_UNORM_S8_UINT:
         case VK_FORMAT_D32_SFLOAT_S8_UINT:
-        /* typeless 深度家族 (Adreno HAL 对它们带 DS 用法同样报 -11).
-         * 用数值字面量: Termux vulkan_core.h 被修剪, 未定义这几个枚举.
-         * 37=R32G8X24_TYPELESS, 38=R32_FLOAT_X8X24_TYPELESS, 39=X32_TYPELESS_G8X24_UINT */
-        case 37:
-        case 38:
-        case 39:
             return 1;
         default:
             return 0;
@@ -353,9 +353,6 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
         VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type,
         VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags,
         VkImageFormatProperties* pProperties) {
-    fprintf(stderr, "[VK_ICD] iffp called: pd=%p fmt=%d type=%d tiling=%d usage=0x%x flags=0x%x\n",
-            (void*)physicalDevice, (int)format, (int)type, (int)tiling, (unsigned)usage, (unsigned)flags);
-    fflush(stderr);
     if (!g_real_iffp || !g_real_fmtp) {
         /* 构造器 NULL 解析没成功 → 按 PD 所属实例解析 (互斥锁保护, 避免多实例竞态) */
         pthread_mutex_lock(&g_lock);
@@ -381,17 +378,28 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    fprintf(stderr, "[VK_ICD] iffp calling real: pd=%p real_iffp=%p ginst=%p\n",
-            (void*)physicalDevice, (void*)g_real_iffp, (void*)g_real_icd_instance);
-    fflush(stderr);
     VkResult r = g_real_iffp(physicalDevice, format, type, tiling, usage, flags, pProperties);
-    fprintf(stderr, "[VK_ICD] iffp real r=%d, is_ds=%d\n", (int)r, fmt_is_depth_stencil(format));
-    fflush(stderr);
     if (r == VK_SUCCESS)
         return r;
 
-    /* 仅当 usage 需要深度/模板, 且格式确属深度/模板时才放宽 */
-    if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && fmt_is_depth_stencil(format)) {
+    if (g_raw_test)
+        return r;  /* 测试模式: 如实返回硬件结果, 不做放宽 */
+
+    /* 深度/模板格式放宽。
+     * 注意: DXVK 的 D3D11CommonTexture::CheckImageSupport 会分别用
+     *   usage=DEPTH_STENCIL_ATTACHMENT(0x20)  -> 能否当深度附件
+     *   usage=SAMPLED(0x4)                    -> 深度纹理能否当 SRV 采样
+     * 两种 usage 各探测一次, 任一失败就把该 DXGI 格式整体标记为不支持并缓存,
+     * 之后 Unity 每次建 RenderTexture 都直接从缓存返回失败 (实测 5594 次
+     * "RenderTexture.Create failed" 而 vkCreateImage 一次都没被调到)。
+     * 所以这里必须把 SAMPLED/TRANSFER 也一起放宽, 只挡住真正没意义的 usage
+     * (STORAGE / COLOR_ATTACHMENT 等)。 */
+    const VkImageUsageFlags ds_ok_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                        | VK_IMAGE_USAGE_SAMPLED_BIT
+                                        | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT
+                                        | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (fmt_is_depth_stencil(format) && (usage & ds_ok_usage) && !(usage & ~ds_ok_usage)) {
         pProperties->maxExtent.width  = 8192;
         pProperties->maxExtent.height = 8192;
         pProperties->maxExtent.depth  = 1;
@@ -405,7 +413,146 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
                 (int)format, (int)tiling, (unsigned)usage);
         return VK_SUCCESS;
     }
+    /* BC 压缩格式: 只要 usage 含 SAMPLED/TRANSFER 就放宽 (HAL 对这些格式 iff p 也常报 -11) */
+    if (fmt_is_bc(format) && (usage & (VK_IMAGE_USAGE_SAMPLED_BIT
+                                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) {
+        pProperties->maxExtent.width  = 8192;
+        pProperties->maxExtent.height = 8192;
+        pProperties->maxExtent.depth  = 1;
+        pProperties->maxMipLevels     = 15;
+        pProperties->maxArrayLayers   = 256;
+        pProperties->sampleCounts     = VK_SAMPLE_COUNT_1_BIT;
+        pProperties->maxResourceSize  = 0x80000000ull;
+        fprintf(stderr, "[VK_ICD] iffp BC 格式放宽: fmt=%d tiling=%d usage=0x%x -> VK_SUCCESS\n",
+                (int)format, (int)tiling, (unsigned)usage);
+        return VK_SUCCESS;
+    }
     return r;
+}
+
+/* ---- vkGetPhysicalDeviceFormatProperties 深度格式修正 ----
+ * 与 iffp 同理: Adreno 540 HAL 的 vkGetPhysicalDeviceFormatProperties(/2) 对
+ * 深度/模板格式(如 D32_SFloat_S8_UInt=94)不报 DEPTH_STENCIL_ATTACHMENT 特性位,
+ * Unity 据此判定 RenderTexture 的 depth/stencil 格式不支持 ->
+ * RenderTexture.Create 失败 -> 游戏场景(渲染到 RenderTexture 的相机)整片黑屏,
+ * 仅 UI 文字可见。这里对深度/模板格式强制补上 DEPTH_STENCIL_ATTACHMENT(+SAMPLED)位。
+ */
+/* 深度/模板格式 + BC 压缩格式 能力修正:
+ * Adreno 540 HAL 对这两类格式在 vkGetPhysicalDeviceFormatProperties 里常常报 0 能力位
+ * (深度如 D32_SFLOAT_S8_UINT=130; 压缩如 BC1~BC7=131..146), 但硬件实际支持。
+ * 报 0 会导致 DXVK/Unity 拒绝创建 -> 深度缓冲黑屏 / 压缩贴图灰屏。
+ * 这里强制补上相应特性位 (深度顶替为 D24S8 真实能力; BC 补 SAMPLED 等)。 */
+static int fmt_is_bc(VkFormat f) {
+    return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK;
+}
+
+static void fmtp_fix_depth(VkPhysicalDevice pd, VkFormat format, VkFormatProperties* p) {
+    if (!p) return;
+    if (g_raw_test) return;  /* 测试模式: 如实暴露硬件能力, 不做任何修补 */
+    if (fmt_is_depth_stencil(format)) {
+        if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            VkFormatProperties good;
+            memset(&good, 0, sizeof(good));
+            if (g_real_fmtp) g_real_fmtp(pd, VK_FORMAT_D24_UNORM_S8_UINT, &good);
+            *p = good;
+            return;
+        }
+        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                 | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        p->linearTilingFeatures  |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                 | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        return;
+    }
+    if (fmt_is_bc(format)) {
+        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT
+                                 | VK_FORMAT_FEATURE_BLIT_SRC_BIT
+                                 | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        p->linearTilingFeatures  |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return;
+    }
+    /* 颜色格式: 若可采样但缺 COLOR_ATTACHMENT (典型 RT 颜色缓冲被 HAL 漏报), 补上。
+     * 这会让 Unity 的 RenderTexture 颜色格式支持检查通过。 */
+    if ((p->optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        && !(p->optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+                                 | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT
+                                 | VK_FORMAT_FEATURE_BLIT_SRC_BIT
+                                 | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        p->linearTilingFeatures  |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
+                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        fprintf(stderr, "[VK_ICD] fmtp ADD_COLOR_ATTACHMENT fmt=%d opt=0x%x\n",
+                (int)format, (unsigned)p->optimalTilingFeatures);
+    }
+    /* 诊断: 真实 HAL 报告完全不支持 (opt/lin 均为 0) 的格式 */
+    if (format >= 40 && format <= 220 &&
+        p->optimalTilingFeatures == 0 && p->linearTilingFeatures == 0)
+        fprintf(stderr, "[VK_ICD] fmtp UNSUPPORTED fmt=%d\n", (int)format);
+}
+
+/* 顺便修正 pNext 链里的 VkFormatProperties3KHR(2KHR 特性位, 64-bit) */
+static void fmtp_fix_depth_pnext(VkFormat format, VkFormatProperties2* p) {
+    if (!p) return;
+    int is_ds = fmt_is_depth_stencil(format) || fmt_is_bc(format);
+    /* 2KHR 位: SAMPLED=0x1, COLOR_ATTACHMENT=0x80, DEPTH_STENCIL_ATTACHMENT=0x200 */
+    VkFlags64 add = is_ds ? (0x200ULL | 0x1ULL) : (0x80ULL | 0x1ULL);
+    struct VkBaseOutStruct { VkStructureType sType; struct VkBaseOutStruct* pNext; };
+    struct VkBaseOutStruct* it = (struct VkBaseOutStruct*)p->pNext;
+    while (it) {
+        if (it->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3_KHR) {
+            typedef struct { VkStructureType sType; void* pNext;
+                             VkFlags64 optimalTilingFeatures;
+                             VkFlags64 linearTilingFeatures;
+                             VkFlags64 bufferFeatures; } Fmt3;
+            Fmt3* p3 = (Fmt3*)it;
+            p3->optimalTilingFeatures |= add;
+            p3->linearTilingFeatures  |= add;
+        }
+        it = it->pNext;
+    }
+}
+
+static void VKAPI_CALL shim_vkGetPhysicalDeviceFormatProperties(
+        VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties* pProperties) {
+    if (!g_real_fmtp) {
+        pthread_mutex_lock(&g_lock);
+        VkInstance owner = inst_for_pd(physicalDevice);
+        InstEntry* e = find_or_add_inst(owner);
+        if (e && !e->fmtp)
+            e->fmtp = (PFN_vkGetPhysicalDeviceFormatProperties)
+                g_get_proc(owner, "vkGetPhysicalDeviceFormatProperties");
+        if (!g_real_fmtp) g_real_fmtp = e ? e->fmtp : NULL;
+        pthread_mutex_unlock(&g_lock);
+    }
+    if (!g_real_fmtp) return;
+    g_real_fmtp(physicalDevice, format, pProperties);
+    fmtp_fix_depth(physicalDevice, format, pProperties);
+}
+
+static PFN_vkGetPhysicalDeviceFormatProperties2 g_real_fmtp2 = NULL;
+static void VKAPI_CALL shim_vkGetPhysicalDeviceFormatProperties2(
+        VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2* pProperties) {
+    if (!g_real_fmtp2) {
+        pthread_mutex_lock(&g_lock);
+        VkInstance owner = inst_for_pd(physicalDevice);
+        g_real_fmtp2 = (PFN_vkGetPhysicalDeviceFormatProperties2)
+            g_get_proc(owner, "vkGetPhysicalDeviceFormatProperties2");
+        pthread_mutex_unlock(&g_lock);
+    }
+    if (!g_real_fmtp2) { /* 退化到 v1 */
+        shim_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &pProperties->formatProperties);
+        return;
+    }
+    g_real_fmtp2(physicalDevice, format, pProperties);
+    fmtp_fix_depth(physicalDevice, format, &pProperties->formatProperties);
+    fmtp_fix_depth_pnext(format, pProperties);
 }
 
 /* 缓存物理设备的内存类型表: vkAllocateMemory 里只有 VkDevice, 拿不到 PD,
@@ -773,6 +920,9 @@ static void icd_init_alias(void) {
     if (s && !strcmp(s, "0")) {
         g_alias_enabled = 0;
         fprintf(stderr, "[VK_ICD] VK_ICD_MAP_LOW=0, 关闭低位 dmabuf 映射 (仅诊断)\n");
+    } else if (g_raw_test) {
+        g_alias_enabled = 0;
+        fprintf(stderr, "[VK_ICD] VK_TEST_RAW=1, 关闭低位 dmabuf 映射 (仅测试用)\n");
     } else {
         fprintf(stderr, "[VK_ICD] 低位 dmabuf 映射已启用: 分配时注入 export+dedicated, "
                         "map 时导出 fd 自行映射到 <4GB\n");
@@ -1026,6 +1176,11 @@ static void VKAPI_CALL shim_vkFreeMemory(VkDevice device, VkDeviceMemory memory,
 /* 低位 dmabuf 方案要拦 alloc/map/unmap/free 四个点, 任一入口被问到时
  * 就把这一整套真实函数指针全部解析好, 避免出现"拦了 alloc 但 map 时
  * 还没有 getFd"这种半成品状态。 */
+static PFN_vkCreateImage g_real_create_image = NULL;
+static PFN_vkCreateImageView g_real_create_image_view = NULL;
+static PFN_vkCreateRenderPass g_real_create_renderpass = NULL;
+static PFN_vkCreateRenderPass2 g_real_create_renderpass2 = NULL;
+static PFN_vkCreateRenderPass2KHR g_real_create_renderpass2khr = NULL;
 static void icd_init_devfns(VkDevice device) {
     static int done = 0;
     if (done) return;
@@ -1039,6 +1194,11 @@ static void icd_init_devfns(VkDevice device) {
     RESOLVE(g_real_free_mem,     PFN_vkFreeMemory,  "vkFreeMemory");
     RESOLVE(g_real_create_buf,   PFN_vkCreateBuffer, "vkCreateBuffer");
     RESOLVE(g_real_destroy_buf,  PFN_vkDestroyBuffer, "vkDestroyBuffer");
+    RESOLVE(g_real_create_image, PFN_vkCreateImage, "vkCreateImage");
+    RESOLVE(g_real_create_image_view, PFN_vkCreateImageView, "vkCreateImageView");
+    RESOLVE(g_real_create_renderpass, PFN_vkCreateRenderPass, "vkCreateRenderPass");
+    RESOLVE(g_real_create_renderpass2, PFN_vkCreateRenderPass2, "vkCreateRenderPass2");
+    RESOLVE(g_real_create_renderpass2khr, PFN_vkCreateRenderPass2KHR, "vkCreateRenderPass2KHR");
     RESOLVE(g_real_buf_reqs,     PFN_vkGetBufferMemoryRequirements, "vkGetBufferMemoryRequirements");
     RESOLVE(g_real_get_mem_fd,   PFN_vkGetMemoryFdKHR, "vkGetMemoryFdKHR");
 #undef RESOLVE
@@ -1052,6 +1212,111 @@ static void icd_init_devfns(VkDevice device) {
         fprintf(stderr, "[VK_ICD] 关键函数缺失, 低位 dmabuf 方案关闭, 走原路径\n");
     }
     fflush(stderr);
+}
+
+/* ---- D32_SFLOAT_S8_UINT -> D24_UNORM_S8_UINT 透明替换 ----
+ * Adreno 540 的 HAL 在 vkGetPhysicalDeviceImageFormatProperties 里对
+ * D32_SFLOAT_S8_UINT(130) 一律返回 VK_ERROR_FORMAT_NOT_SUPPORTED, 而
+ * D24_UNORM_S8_UINT(129) 是真正受支持的深度格式。但 DXVK 静态把
+ * DXGI D32_FLOAT_S8X24 映射到 VK D32S8 且不会自动回退, 因此我们只得在
+ * 这里把 D32S8 透明替换成 D24S8: 创建图像、视图、RenderPass 三处必须一致,
+ * 否则 Vulkan 会因 image/view/renderpass 格式不匹配而报错。
+ * 注意: 只替换这一种格式, 其它深度格式(D32F/D24X8/D16)HAL 本来支持。
+ */
+static const VkFormat DEPTH_D32S8 = VK_FORMAT_D32_SFLOAT_S8_UINT;
+static const VkFormat DEPTH_D24S8 = VK_FORMAT_D24_UNORM_S8_UINT;
+
+/* ---- vkCreateImage: D32S8 -> D24S8 ---- */
+static VkResult VKAPI_CALL shim_vkCreateImage(VkDevice device,
+        const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+        VkImage* pImage) {
+    VkImageCreateInfo info = *pCreateInfo;
+    if (!g_raw_test && info.format == DEPTH_D32S8) {
+        info.format = DEPTH_D24S8;
+        fprintf(stderr, "[VK_ICD] D32S8->D24S8 image sub: type=%d tiling=%d usage=0x%x samples=%d\n",
+                (int)info.imageType, (int)info.tiling, (unsigned)info.usage, (int)info.samples);
+        fflush(stderr);
+    }
+    VkResult r = g_real_create_image(device, &info, pAllocator, pImage);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[VK_ICD] vkCreateImage FAILED fmt=%d type=%d tiling=%d usage=0x%x samples=%d r=%d\n",
+                (int)info.format, (int)info.imageType, (int)info.tiling,
+                (unsigned)info.usage, (int)info.samples, (int)r);
+        fflush(stderr);
+    }
+    return r;
+}
+
+/* ---- vkCreateImageView: D32S8 -> D24S8 ---- */
+static VkResult VKAPI_CALL shim_vkCreateImageView(VkDevice device,
+        const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+        VkImageView* pView) {
+    VkImageViewCreateInfo info = *pCreateInfo;
+    if (!g_raw_test && info.format == DEPTH_D32S8) {
+        info.format = DEPTH_D24S8;
+        fprintf(stderr, "[VK_ICD] D32S8->D24S8 view sub\n");
+        fflush(stderr);
+    }
+    if (!g_real_create_image_view) return VK_ERROR_INITIALIZATION_FAILED;
+    return g_real_create_image_view(device, &info, pAllocator, pView);
+}
+
+/* ---- VkAttachmentDescription 中 D32S8 -> D24S8 (处理数组副本) ---- */
+static void rp_fix_attachments(int count, void* pAtts, size_t stride, size_t fmt_off) {
+    for (int i = 0; i < count; i++) {
+        char* a = (char*)pAtts + (size_t)i * stride;
+        VkFormat* f = (VkFormat*)(a + fmt_off);
+        if (*f == DEPTH_D32S8) *f = DEPTH_D24S8;
+    }
+}
+
+/* ---- vkCreateRenderPass: D32S8 -> D24S8 ---- */
+static VkResult VKAPI_CALL shim_vkCreateRenderPass(VkDevice device,
+        const VkRenderPassCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+        VkRenderPass* pRP) {
+    if (!g_real_create_renderpass) return VK_ERROR_INITIALIZATION_FAILED;
+    VkAttachmentDescription* atts = NULL;
+    VkRenderPassCreateInfo info = *pCreateInfo;
+    if (!g_raw_test && pCreateInfo->pAttachments && pCreateInfo->attachmentCount > 0) {
+        atts = malloc(sizeof(VkAttachmentDescription) * pCreateInfo->attachmentCount);
+        if (!atts) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        memcpy(atts, pCreateInfo->pAttachments,
+               sizeof(VkAttachmentDescription) * pCreateInfo->attachmentCount);
+        rp_fix_attachments(pCreateInfo->attachmentCount, atts,
+                           sizeof(VkAttachmentDescription),
+                           offsetof(VkAttachmentDescription, format));
+        info.pAttachments = atts;
+    }
+    VkResult r = g_real_create_renderpass(device, &info, pAllocator, pRP);
+    free(atts);
+    return r;
+}
+
+/* ---- vkCreateRenderPass2 / 2KHR: D32S8 -> D24S8 ----
+ * VkAttachmentDescription2 与 VkAttachmentDescription 的 format 字段偏移不同,
+ * 用各自的 offsetof 处理。结构体整体浅拷贝即可保留 pNext。
+ */
+static VkResult VKAPI_CALL shim_vkCreateRenderPass2(VkDevice device,
+        const VkRenderPassCreateInfo2* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+        VkRenderPass* pRP) {
+    PFN_vkCreateRenderPass2 f = g_real_create_renderpass2 ? g_real_create_renderpass2
+                                                          : (PFN_vkCreateRenderPass2)g_real_create_renderpass2khr;
+    if (!f) return VK_ERROR_INITIALIZATION_FAILED;
+    VkAttachmentDescription2* atts = NULL;
+    VkRenderPassCreateInfo2 info = *pCreateInfo;
+    if (!g_raw_test && pCreateInfo->pAttachments && pCreateInfo->attachmentCount > 0) {
+        atts = malloc(sizeof(VkAttachmentDescription2) * pCreateInfo->attachmentCount);
+        if (!atts) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        memcpy(atts, pCreateInfo->pAttachments,
+               sizeof(VkAttachmentDescription2) * pCreateInfo->attachmentCount);
+        rp_fix_attachments(pCreateInfo->attachmentCount, atts,
+                           sizeof(VkAttachmentDescription2),
+                           offsetof(VkAttachmentDescription2, format));
+        info.pAttachments = atts;
+    }
+    VkResult r = f(device, &info, pAllocator, pRP);
+    free(atts);
+    return r;
 }
 
 static PFN_vkVoidFunction VKAPI_CALL shim_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
@@ -1071,6 +1336,23 @@ static PFN_vkVoidFunction VKAPI_CALL shim_vkGetDeviceProcAddr(VkDevice device, c
     if (!strcmp(pName, "vkFreeMemory")) {
         icd_init_devfns(device);
         if (g_real_free_mem) return (PFN_vkVoidFunction)shim_vkFreeMemory;
+    }
+    if (!strcmp(pName, "vkCreateImage")) {
+        icd_init_devfns(device);
+        if (g_real_create_image) return (PFN_vkVoidFunction)shim_vkCreateImage;
+    }
+    if (!strcmp(pName, "vkCreateImageView")) {
+        icd_init_devfns(device);
+        if (g_real_create_image_view) return (PFN_vkVoidFunction)shim_vkCreateImageView;
+    }
+    if (!strcmp(pName, "vkCreateRenderPass")) {
+        icd_init_devfns(device);
+        if (g_real_create_renderpass) return (PFN_vkVoidFunction)shim_vkCreateRenderPass;
+    }
+    if (!strcmp(pName, "vkCreateRenderPass2") || !strcmp(pName, "vkCreateRenderPass2KHR")) {
+        icd_init_devfns(device);
+        if (g_real_create_renderpass2 || g_real_create_renderpass2khr)
+            return (PFN_vkVoidFunction)shim_vkCreateRenderPass2;
     }
     return g_real_get_dev_proc(device, pName);
 }
@@ -1102,6 +1384,7 @@ static void link_namespaces(void) {
 __attribute__((constructor))
 static void icd_constructor(void) {
     install_crash_handler();
+    g_raw_test = getenv("VK_TEST_RAW") ? 1 : 0;
     link_namespaces();
     g_drv = dlopen(ADRENO_VK_DRIVER, RTLD_LAZY | RTLD_GLOBAL);
     if (!g_drv) {
@@ -1138,6 +1421,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance in
         if (g_real_get_dev_proc) return (PFN_vkVoidFunction)shim_vkGetDeviceProcAddr;
     }
     if (!strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties")) return (PFN_vkVoidFunction)shim_vkGetPhysicalDeviceImageFormatProperties;
+    if (!strcmp(pName, "vkGetPhysicalDeviceFormatProperties")) return (PFN_vkVoidFunction)shim_vkGetPhysicalDeviceFormatProperties;
+    if (!strcmp(pName, "vkGetPhysicalDeviceFormatProperties2")) return (PFN_vkVoidFunction)shim_vkGetPhysicalDeviceFormatProperties2;
     return g_get_proc(instance, pName);
 }
 
@@ -1145,6 +1430,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkPhysi
     if (!g_get_proc) return NULL;
     if (!strcmp(pName, "vkCreateDevice")) return (PFN_vkVoidFunction)shim_vkCreateDevice;
     if (!strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties")) return (PFN_vkVoidFunction)shim_vkGetPhysicalDeviceImageFormatProperties;
+    if (!strcmp(pName, "vkGetPhysicalDeviceFormatProperties")) return (PFN_vkVoidFunction)shim_vkGetPhysicalDeviceFormatProperties;
+    if (!strcmp(pName, "vkGetPhysicalDeviceFormatProperties2")) return (PFN_vkVoidFunction)shim_vkGetPhysicalDeviceFormatProperties2;
     /* 驱动 dispatcher 按 pName 选择函数; physical device 函数经 vkGetInstanceProcAddr
      * 取得后由调用方传入正确的 PD 句柄即可。 */
     return g_get_proc((VkInstance)physicalDevice, pName);
