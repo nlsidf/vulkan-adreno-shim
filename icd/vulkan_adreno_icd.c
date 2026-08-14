@@ -67,6 +67,12 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
  * 让测试程序能观察 Adreno 硬件对 D32S8 的真实行为。默认关闭, 不影响游戏。 */
 static int g_raw_test = 0;
 
+/* 日志分级: 默认只打印初始化/错误等一次性日志; 设 VK_ICD_VERBOSE>=2 才打印
+ * 热路径(persistent)诊断(iffp/fmtp/深度替换等)。这些日志每次格式探测/每个深度
+ * 资源都会打一行, 不关的话一局游戏能写到几 MB, 故默认静默, 需调试时再开。 */
+static int g_shim_verbose = 0;
+#define SHIM_DBG(...) do { if (g_shim_verbose >= 2) fprintf(stderr, __VA_ARGS__); } while (0)
+
 #define MAX_INST 16
 #define MAX_PD   32
 typedef struct { VkInstance inst; PFN_vkGetPhysicalDeviceImageFormatProperties iffp; PFN_vkGetPhysicalDeviceFormatProperties fmtp; } InstEntry;
@@ -409,7 +415,7 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
                                       | VK_SAMPLE_COUNT_2_BIT
                                       | VK_SAMPLE_COUNT_4_BIT;
         pProperties->maxResourceSize  = 0x80000000ull;
-        fprintf(stderr, "[VK_ICD] iffp 深度格式放宽: fmt=%d tiling=%d usage=0x%x -> VK_SUCCESS\n",
+        SHIM_DBG("[VK_ICD] iffp 深度格式放宽: fmt=%d tiling=%d usage=0x%x -> VK_SUCCESS\n",
                 (int)format, (int)tiling, (unsigned)usage);
         return VK_SUCCESS;
     }
@@ -424,7 +430,7 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
         pProperties->maxArrayLayers   = 256;
         pProperties->sampleCounts     = VK_SAMPLE_COUNT_1_BIT;
         pProperties->maxResourceSize  = 0x80000000ull;
-        fprintf(stderr, "[VK_ICD] iffp BC 格式放宽: fmt=%d tiling=%d usage=0x%x -> VK_SUCCESS\n",
+        SHIM_DBG("[VK_ICD] iffp BC 格式放宽: fmt=%d tiling=%d usage=0x%x -> VK_SUCCESS\n",
                 (int)format, (int)tiling, (unsigned)usage);
         return VK_SUCCESS;
     }
@@ -488,13 +494,13 @@ static void fmtp_fix_depth(VkPhysicalDevice pd, VkFormat format, VkFormatPropert
         p->linearTilingFeatures  |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
                                  | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
                                  | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        fprintf(stderr, "[VK_ICD] fmtp ADD_COLOR_ATTACHMENT fmt=%d opt=0x%x\n",
+        SHIM_DBG("[VK_ICD] fmtp ADD_COLOR_ATTACHMENT fmt=%d opt=0x%x\n",
                 (int)format, (unsigned)p->optimalTilingFeatures);
     }
     /* 诊断: 真实 HAL 报告完全不支持 (opt/lin 均为 0) 的格式 */
     if (format >= 40 && format <= 220 &&
         p->optimalTilingFeatures == 0 && p->linearTilingFeatures == 0)
-        fprintf(stderr, "[VK_ICD] fmtp UNSUPPORTED fmt=%d\n", (int)format);
+        SHIM_DBG("[VK_ICD] fmtp UNSUPPORTED fmt=%d\n", (int)format);
 }
 
 /* 顺便修正 pNext 链里的 VkFormatProperties3KHR(2KHR 特性位, 64-bit) */
@@ -1233,7 +1239,7 @@ static VkResult VKAPI_CALL shim_vkCreateImage(VkDevice device,
     VkImageCreateInfo info = *pCreateInfo;
     if (!g_raw_test && info.format == DEPTH_D32S8) {
         info.format = DEPTH_D24S8;
-        fprintf(stderr, "[VK_ICD] D32S8->D24S8 image sub: type=%d tiling=%d usage=0x%x samples=%d\n",
+        SHIM_DBG("[VK_ICD] D32S8->D24S8 image sub: type=%d tiling=%d usage=0x%x samples=%d\n",
                 (int)info.imageType, (int)info.tiling, (unsigned)info.usage, (int)info.samples);
         fflush(stderr);
     }
@@ -1254,7 +1260,7 @@ static VkResult VKAPI_CALL shim_vkCreateImageView(VkDevice device,
     VkImageViewCreateInfo info = *pCreateInfo;
     if (!g_raw_test && info.format == DEPTH_D32S8) {
         info.format = DEPTH_D24S8;
-        fprintf(stderr, "[VK_ICD] D32S8->D24S8 view sub\n");
+        SHIM_DBG("[VK_ICD] D32S8->D24S8 view sub\n");
         fflush(stderr);
     }
     if (!g_real_create_image_view) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1385,6 +1391,7 @@ __attribute__((constructor))
 static void icd_constructor(void) {
     install_crash_handler();
     g_raw_test = getenv("VK_TEST_RAW") ? 1 : 0;
+    { const char* _v = getenv("VK_ICD_VERBOSE"); if (_v) g_shim_verbose = atoi(_v); }
     link_namespaces();
     g_drv = dlopen(ADRENO_VK_DRIVER, RTLD_LAZY | RTLD_GLOBAL);
     if (!g_drv) {
