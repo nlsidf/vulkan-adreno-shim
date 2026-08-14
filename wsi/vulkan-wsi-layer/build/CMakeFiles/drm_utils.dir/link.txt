@@ -1,2 +1,0 @@
-/data/data/com.termux/files/usr/bin/llvm-ar qc libdrm_utils.a CMakeFiles/drm_utils.dir/util/drm/drm_utils.cpp.o CMakeFiles/drm_utils.dir/util/drm/format_table.c.o
-/data/data/com.termux/files/usr/bin/llvm-ranlib libdrm_utils.a

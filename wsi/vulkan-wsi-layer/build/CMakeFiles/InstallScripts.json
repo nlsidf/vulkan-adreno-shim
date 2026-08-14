@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/data/data/com.termux/files/home/proton11/.build/vulkan-wsi-layer/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
