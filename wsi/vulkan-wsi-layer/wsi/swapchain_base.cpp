@@ -57,7 +57,13 @@ void swapchain_base::page_flip_thread()
 {
    auto &sc_images = m_swapchain_images;
    VkResult vk_res = VK_SUCCESS;
-   uint64_t timeout = UINT64_MAX;
+   /* Bounded wait: an infinite timeout here would permanently wedge the present
+    * thread (and the whole swapchain) if a present fence never signals. Bound it
+    * so the WARNING/retry loop below can make forward progress instead of
+    * deadlocking silently. Normal presents complete within a frame, so this
+    * never triggers in correct operation. */
+   constexpr uint64_t PRESENT_FENCE_TIMEOUT = 1000000000ULL; /* 1 second */
+   uint64_t timeout = PRESENT_FENCE_TIMEOUT;
    constexpr uint64_t SEMAPHORE_TIMEOUT = 250000000; /* 250 ms. */
 
    /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
@@ -719,28 +725,41 @@ void swapchain_base::deprecate(VkSwapchainKHR descendant)
 void swapchain_base::wait_for_pending_buffers()
 {
    std::unique_lock<std::mutex> acquire_lock(m_image_acquire_lock);
-   int wait;
-   int acquired_images = 0;
    std::unique_lock<std::recursive_mutex> image_status_lock(m_image_status_mutex);
 
+   /* The point of this wait is to let the ancestor swapchain finish presenting the
+    * frames that are currently in flight, so the descendant's first present cannot
+    * overtake the ancestor's last frame.
+    *
+    * Only PENDING (in-flight) images can actually become free: a FREE image has
+    * already been presented and will not be presented again, and an ACQUIRED image is
+    * held by the application and will not be released. For a deprecated swapchain the
+    * application has moved on (it will never release ACQUIRED images) and its FREE
+    * images were already destroyed by deprecate(), so waiting for those two states
+    * would block forever. Wait only for the images that are genuinely in flight.
+    *
+    * One PENDING image may be handed to a compositor and never change state (the WSI
+    * backend cannot always tell which), so wait for all but that one. */
+   int pending_images = 0;
    for (auto &img : m_swapchain_images)
    {
-      if (img.status == swapchain_image::ACQUIRED)
-      {
-         acquired_images++;
-      }
+      if (img.status == swapchain_image::PENDING)
+         pending_images++;
    }
-
-   /* Waiting for free images waits for both free and pending. One pending image may be presented and acquired by a
-    * compositor. The WSI backend may not necessarily know which pending image is presented to change its state. It may
-    * be impossible to wait for that one presented image. */
-   wait = static_cast<int>(m_swapchain_images.size()) - acquired_images - 1;
+   int wait = pending_images > 0 ? pending_images - 1 : 0;
    image_status_lock.unlock();
 
+   /* Bounded only as a safety net: in correct operation the ancestor's present thread
+    * drains its pending images promptly, so this never triggers. */
+   constexpr uint64_t ANCESTOR_DRAIN_TIMEOUT = 500000000ULL; /* 500 ms */
    while (wait > 0)
    {
-      /* Take down one free image semaphore. */
-      wait_for_free_buffer(UINT64_MAX);
+      if (wait_for_free_buffer(ANCESTOR_DRAIN_TIMEOUT) != VK_SUCCESS)
+      {
+         WSI_LOG_WARNING("Ancestor swapchain did not drain pending buffers; "
+                         "proceeding with first present to avoid a deadlock.");
+         break;
+      }
       --wait;
    }
 }

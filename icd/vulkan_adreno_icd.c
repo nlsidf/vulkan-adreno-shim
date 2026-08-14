@@ -40,7 +40,11 @@ typedef PFN_vkVoidFunction (VKAPI_PTR *PFN_adreno_get_proc)(VkInstance, const ch
 
 static void*            g_drv = NULL;
 static PFN_adreno_get_proc g_get_proc = NULL;
-static VkPhysicalDeviceFeatures g_fake_feats; /* 实验: 最小特性集 */
+/* 实验: 最小特性集 — 仅 EXPERIMENT_MIN_FEATURES / EXPERIMENT_REBUILD 编译时启用,
+ * 故声明与用法一并用同样的条件包裹, 避免正式构建时产生 unused-variable 警告。 */
+#if defined(EXPERIMENT_MIN_FEATURES) || defined(EXPERIMENT_REBUILD)
+static VkPhysicalDeviceFeatures g_fake_feats;
+#endif
 
 /* ---- vkCreateDevice 扩展过滤 (修复 DXVK-Sarek) ----
  * DXVK 请求的扩展含 VK_KHR_external_semaphore_win32, Adreno 540 HAL 不支持,
@@ -325,8 +329,6 @@ static VkResult VKAPI_CALL shim_vkEnumeratePhysicalDevices(VkInstance instance,
     return r;
 }
 
-static int fmt_is_bc(VkFormat f); /* 前向声明, 定义在 fmtp 修正区 */
-
 /* ---- vkGetPhysicalDeviceImageFormatProperties 深度格式修正 ----
  * Adreno 540 HAL 对深度/模板格式的 imageFormatProperties 查询总是返回
  * VK_ERROR_FORMAT_NOT_SUPPORTED (-11), 连 D16_UNORM 都失败 (实测 imgfmt_probe),
@@ -405,7 +407,7 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
                                         | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT
                                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                                         | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (fmt_is_depth_stencil(format) && (usage & ds_ok_usage) && !(usage & ~ds_ok_usage)) {
+    if (fmt_is_depth_stencil(format) && (usage & ds_ok_usage) && !(usage & ~ds_ok_usage)) { /* 深度放宽: SPECIMEN 需要 */
         pProperties->maxExtent.width  = 8192;
         pProperties->maxExtent.height = 8192;
         pProperties->maxExtent.depth  = 1;
@@ -419,44 +421,26 @@ static VkResult VKAPI_CALL shim_vkGetPhysicalDeviceImageFormatProperties(
                 (int)format, (int)tiling, (unsigned)usage);
         return VK_SUCCESS;
     }
-    /* BC 压缩格式: 只要 usage 含 SAMPLED/TRANSFER 就放宽 (HAL 对这些格式 iff p 也常报 -11) */
-    if (fmt_is_bc(format) && (usage & (VK_IMAGE_USAGE_SAMPLED_BIT
-                                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) {
-        pProperties->maxExtent.width  = 8192;
-        pProperties->maxExtent.height = 8192;
-        pProperties->maxExtent.depth  = 1;
-        pProperties->maxMipLevels     = 15;
-        pProperties->maxArrayLayers   = 256;
-        pProperties->sampleCounts     = VK_SAMPLE_COUNT_1_BIT;
-        pProperties->maxResourceSize  = 0x80000000ull;
-        SHIM_DBG("[VK_ICD] iffp BC 格式放宽: fmt=%d tiling=%d usage=0x%x -> VK_SUCCESS\n",
-                (int)format, (int)tiling, (unsigned)usage);
-        return VK_SUCCESS;
-    }
+    /* BC 压缩格式曾做过放宽(谎报 SAMPLED/TRANSFER 能力), 实测为负优化:
+     * 让 Unity/DXVK 选中 Adreno 540 实际无法正确渲染的压缩格式做 RenderTexture,
+     * 导致整屏黑(星白列车 VN 即因此黑屏)。Adreno 540 对 BC 报 0 能力位是如实
+     * 行为, 不再谎报。 */
     return r;
 }
 
 /* ---- vkGetPhysicalDeviceFormatProperties 深度格式修正 ----
  * 与 iffp 同理: Adreno 540 HAL 的 vkGetPhysicalDeviceFormatProperties(/2) 对
- * 深度/模板格式(如 D32_SFloat_S8_UInt=94)不报 DEPTH_STENCIL_ATTACHMENT 特性位,
- * Unity 据此判定 RenderTexture 的 depth/stencil 格式不支持 ->
- * RenderTexture.Create 失败 -> 游戏场景(渲染到 RenderTexture 的相机)整片黑屏,
- * 仅 UI 文字可见。这里对深度/模板格式强制补上 DEPTH_STENCIL_ATTACHMENT(+SAMPLED)位。
- */
-/* 深度/模板格式 + BC 压缩格式 能力修正:
- * Adreno 540 HAL 对这两类格式在 vkGetPhysicalDeviceFormatProperties 里常常报 0 能力位
- * (深度如 D32_SFLOAT_S8_UINT=130; 压缩如 BC1~BC7=131..146), 但硬件实际支持。
- * 报 0 会导致 DXVK/Unity 拒绝创建 -> 深度缓冲黑屏 / 压缩贴图灰屏。
- * 这里强制补上相应特性位 (深度顶替为 D24S8 真实能力; BC 补 SAMPLED 等)。 */
-static int fmt_is_bc(VkFormat f) {
-    return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK;
-}
-
+ * 深度/模板格式(如 D32_SFloat_S8_UInt=94 / D32_SFLOAT_S8_UINT=130)不报
+ * DEPTH_STENCIL_ATTACHMENT 特性位, Unity 据此判定 RenderTexture 的 depth/stencil
+ * 格式不支持 -> RenderTexture.Create 失败 -> 游戏场景(渲染到 RenderTexture 的相机)
+ * 整片黑屏, 仅 UI 文字可见。这里对深度/模板格式强制补上
+ * DEPTH_STENCIL_ATTACHMENT(+SAMPLED)位 (D32S8 直接顶替为 D24S8 真实能力)。
+ * 注意: BC 压缩格式与颜色格式的能力谎报均已移除, 实测对 Adreno 540 是负优化
+ * (让 DXVK 选中无法正确渲染的格式 -> 整屏黑)。 */
 static void fmtp_fix_depth(VkPhysicalDevice pd, VkFormat format, VkFormatProperties* p) {
     if (!p) return;
     if (g_raw_test) return;  /* 测试模式: 如实暴露硬件能力, 不做任何修补 */
-    if (fmt_is_depth_stencil(format)) {
+    if (fmt_is_depth_stencil(format)) { /* 深度谎报: SPECIMEN 需要 */
         if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
             VkFormatProperties good;
             memset(&good, 0, sizeof(good));
@@ -470,33 +454,11 @@ static void fmtp_fix_depth(VkPhysicalDevice pd, VkFormat format, VkFormatPropert
                                  | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
         return;
     }
-    if (fmt_is_bc(format)) {
-        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT
-                                 | VK_FORMAT_FEATURE_BLIT_SRC_BIT
-                                 | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        p->linearTilingFeatures  |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        return;
-    }
-    /* 颜色格式: 若可采样但缺 COLOR_ATTACHMENT (典型 RT 颜色缓冲被 HAL 漏报), 补上。
-     * 这会让 Unity 的 RenderTexture 颜色格式支持检查通过。 */
-    if ((p->optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
-        && !(p->optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
-        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
-                                 | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT
-                                 | VK_FORMAT_FEATURE_BLIT_SRC_BIT
-                                 | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        p->linearTilingFeatures  |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
-                                 | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        SHIM_DBG("[VK_ICD] fmtp ADD_COLOR_ATTACHMENT fmt=%d opt=0x%x\n",
-                (int)format, (unsigned)p->optimalTilingFeatures);
-    }
+    /* 曾对"可采样但缺 COLOR_ATTACHMENT"的格式补 COLOR_ATTACHMENT 位(颜色格式谎报),
+     * 实测是负优化: Unity/DXVK 会选中 Adreno 540 实际不能当 color attachment 渲染的
+     * 格式做 RenderTexture, 整屏黑 (星白列车 VN 即因此黑屏)。HAL 真正支持的 RT 颜色
+     * 格式本来就带 COLOR_ATTACHMENT 位, 无需谎报, 故此处仅如实回传能力。
+     * (BC 压缩格式谎报亦已移除, 同理。) */
     /* 诊断: 真实 HAL 报告完全不支持 (opt/lin 均为 0) 的格式 */
     if (format >= 40 && format <= 220 &&
         p->optimalTilingFeatures == 0 && p->linearTilingFeatures == 0)
@@ -506,9 +468,9 @@ static void fmtp_fix_depth(VkPhysicalDevice pd, VkFormat format, VkFormatPropert
 /* 顺便修正 pNext 链里的 VkFormatProperties3KHR(2KHR 特性位, 64-bit) */
 static void fmtp_fix_depth_pnext(VkFormat format, VkFormatProperties2* p) {
     if (!p) return;
-    int is_ds = fmt_is_depth_stencil(format) || fmt_is_bc(format);
-    /* 2KHR 位: SAMPLED=0x1, COLOR_ATTACHMENT=0x80, DEPTH_STENCIL_ATTACHMENT=0x200 */
-    VkFlags64 add = is_ds ? (0x200ULL | 0x1ULL) : (0x80ULL | 0x1ULL);
+    if (!fmt_is_depth_stencil(format)) return;  /* 只修深度/模板格式; 颜色/BC 不再谎报 */
+    /* 2KHR 位: SAMPLED=0x1, DEPTH_STENCIL_ATTACHMENT=0x200 */
+    VkFlags64 add = 0x200ULL | 0x1ULL;
     struct VkBaseOutStruct { VkStructureType sType; struct VkBaseOutStruct* pNext; };
     struct VkBaseOutStruct* it = (struct VkBaseOutStruct*)p->pNext;
     while (it) {
