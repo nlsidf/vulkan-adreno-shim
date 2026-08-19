@@ -331,6 +331,12 @@ pub unsafe extern "C" fn shim_create_device(
 
     let dev_alloc = alloc::icd_pick_alloc(p_allocator);
     let r = real(physical_device, &ci, dev_alloc, p_device);
+    if r == VK_SUCCESS && !p_device.is_null() {
+        // 锚定全局设备, 供命令层拦截 (Copy/Blit/Resolve/ClearDepth) 兜底解析真实
+        // 函数指针。原生 D24S8 应用 (如 Undertale/D3D9) 不会写入 IMAGE_FORMAT_MAP,
+        // 命令层无法从图像反查 device, 必须靠这里。
+        crate::set_global_device(*p_device);
+    }
     crate::shim_log!(
         "real vkCreateDevice -> {} ({})",
         r,
@@ -368,7 +374,24 @@ fn image_real_entry(image: VkImage) -> Option<(VkFormat, VkDevice)> {
 
 #[inline]
 fn image_is_substituted(image: VkImage) -> bool {
-    image_real_entry(image).is_some_and(|(f, _)| f == DEPTH_D24S8)
+    // 仅"被 D32S8->D24S8 替换过"的图像返回 true (映射表里记的是 DEPTH_D32S8 标记)。
+    // 原生 D24S8 图像不在映射表中, 这里返回 false -> 命令层对它完全透传 (与 C 版一致)。
+    image_real_entry(image).is_some_and(|(f, _)| f == DEPTH_D32S8)
+}
+
+/// 命令层解析 VkDevice 的兜底来源。
+///
+/// 优先从 IMAGE_FORMAT_MAP 反查 (D32S8 替换过的图像确实记了 device),
+/// 其次退回到 vkCreateDevice 时锚定的全局 device。这样即使原生 D24S8 应用
+/// (Undertale/D3D9) 不触发任何替换、地图为空, 命令层也能解析到真实函数指针,
+/// 从而**绝不丢弃** vkCmdCopy/Blit/Resolve/ClearDepth 调用 —— 旧实现查不到
+/// 图像就直接 return, 把整条命令吞掉, 正是黑屏根因。
+#[inline]
+fn cmd_device(src: VkImage, dst: VkImage) -> Option<VkDevice> {
+    image_real_entry(src)
+        .or_else(|| image_real_entry(dst))
+        .map(|(_, d)| d)
+        .or_else(crate::global_device)
 }
 
 pub unsafe extern "C" fn shim_create_image(
@@ -383,8 +406,12 @@ pub unsafe extern "C" fn shim_create_image(
     let info = unsafe { &*p_create_info };
     let mut ci = *info;
     // 完美伪装: 应用请求 D32S8 时, 透明替换成硬件真正支持的 D24S8 创建。
-    // 创建成功后把实际格式记入映射表, 供命令层 (清除/拷贝等) 判断真实布局。
-    if !raw_test() && ci.format == DEPTH_D32S8 {
+    // 仅"原始请求就是 D32S8"的图像才视为被替换 (substituted), 记入映射表供
+    // 命令层 (清除/拷贝等) 判断真实布局。原生 D24S8 应用 (如 Undertale/D3D9)
+    // 请求的就是 D24S8, 替换后格式同为 D24S8, 若据此误判为"被替换"会让命令层
+    // 对它做多余的伪装处理 -> 黑屏。故必须以"原始请求格式"区分, 与 C 版一致。
+    let substituted_d32 = !raw_test() && info.format == DEPTH_D32S8;
+    if substituted_d32 {
         ci.format = DEPTH_D24S8;
         crate::shim_dbg!(
             "D32S8->D24S8 image sub: type={} tiling={} usage=0x{:x} samples={}",
@@ -404,10 +431,12 @@ pub unsafe extern "C" fn shim_create_image(
     let r = real(device, &ci, p_allocator, p_image);
     if r == VK_SUCCESS && !p_image.is_null() {
         let image = *p_image;
-        if ci.format == DEPTH_D24S8 {
+        // 仅真正被 D32S8->D24S8 替换的图像记入映射表, 并用 D32S8 作为"被替换"
+        // 标记 (原生 D24S8 不记, 命令层据此对它完全透传, 与 C 版行为一致)。
+        if substituted_d32 {
             if let Ok(mut g) = IMAGE_FORMAT_MAP.write() {
-                g.insert(image, (DEPTH_D24S8, device));
-                crate::shim_dbg!("record image {:p} -> D24S8 (dev {:p})", image, device);
+                g.insert(image, (DEPTH_D32S8, device));
+                crate::shim_dbg!("record image {:p} -> D32S8(sub) (dev {:p})", image, device);
             }
         }
     }
@@ -548,10 +577,10 @@ pub unsafe extern "C" fn shim_cmd_clear_depth_stencil_image(
     range_count: u32,
     p_ranges: *const VkImageSubresourceRange,
 ) {
-    let Some(entry) = image_real_entry(image) else {
+    let Some(device) = cmd_device(image, image) else {
+        // 查不到设备 (理论上不会发生在 device 创建后), 为安全起见直接丢弃以免误用空指针。
         return;
     };
-    let (_, device) = entry;
     let Some(real) = crate::dev_fns_global(device).cmd_clear_depth_stencil_image else {
         return;
     };
@@ -599,9 +628,7 @@ pub unsafe extern "C" fn shim_cmd_copy_image(
     region_count: u32,
     p_regions: *const VkImageCopy,
 ) {
-    let Some(device) = image_real_entry(src_image).map(|(_, d)| d).or_else(|| {
-        image_real_entry(dst_image).map(|(_, d)| d)
-    }) else {
+    let Some(device) = cmd_device(src_image, dst_image) else {
         return;
     };
     let Some(real) = crate::dev_fns_global(device).cmd_copy_image else {
@@ -637,9 +664,7 @@ pub unsafe extern "C" fn shim_cmd_blit_image(
     p_regions: *const VkImageBlit,
     filter: i32,
 ) {
-    let Some(device) = image_real_entry(src_image).map(|(_, d)| d).or_else(|| {
-        image_real_entry(dst_image).map(|(_, d)| d)
-    }) else {
+    let Some(device) = cmd_device(src_image, dst_image) else {
         return;
     };
     let Some(real) = crate::dev_fns_global(device).cmd_blit_image else {
@@ -673,9 +698,7 @@ pub unsafe extern "C" fn shim_cmd_resolve_image(
     region_count: u32,
     p_regions: *const VkImageResolve,
 ) {
-    let Some(device) = image_real_entry(src_image).map(|(_, d)| d).or_else(|| {
-        image_real_entry(dst_image).map(|(_, d)| d)
-    }) else {
+    let Some(device) = cmd_device(src_image, dst_image) else {
         return;
     };
     let Some(real) = crate::dev_fns_global(device).cmd_resolve_image else {

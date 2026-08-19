@@ -77,6 +77,23 @@ pub fn bc_fix() -> bool {
 
 /// VK_ICD_VERBOSE>=2: 打开热路径诊断 (默认静默, 见 C 版 1f0ff6d)。
 static VERBOSE: OnceLock<i32> = OnceLock::new();
+
+/// 全局锚定的设备句柄。命令层拦截 (vkCmdCopy/Blit/Resolve/ClearDepth) 需要
+/// VkDevice 来解析真实函数指针, 但原生 D24S8 应用 (如 Undertale/D3D9) 不会触发
+/// D32S8->D24S8 替换, 因此 IMAGE_FORMAT_MAP 为空, 无法从图像反查 device。
+/// 这里在 vkCreateDevice 成功后锚定一个全局 device, 作为命令层解析真实函数的
+/// 兜底来源 —— 这样命令层即使查不到图像, 也绝不丢弃调用 (否则会黑屏)。
+static GLOBAL_DEVICE: OnceLock<ffi::VkDevice> = OnceLock::new();
+
+/// vkCreateDevice 成功后锚定全局设备 (多设备场景下取首个, 足以覆盖命令层转发)。
+pub fn set_global_device(device: ffi::VkDevice) {
+    let _ = GLOBAL_DEVICE.get_or_init(|| device);
+}
+
+/// 命令层兜底取设备; 查不到时返回 None (此时上层仍应原样转发, 见 intercept.rs)。
+pub fn global_device() -> Option<ffi::VkDevice> {
+    GLOBAL_DEVICE.get().copied()
+}
 pub fn verbose() -> i32 {
     *VERBOSE.get_or_init(|| env_int(c"VK_ICD_VERBOSE"))
 }
