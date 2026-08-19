@@ -9,6 +9,7 @@ use crate::memalias;
 use crate::raw_test;
 use core::ptr::null_mut;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 /* ---- 扩展白名单/黑名单 (同 C 版) ---- */
@@ -367,6 +368,23 @@ pub const DEPTH_D24S8: i32 = VK_FORMAT_D24_UNORM_S8_UINT;
 static IMAGE_FORMAT_MAP: LazyLock<RwLock<HashMap<VkImage, (VkFormat, VkDevice)>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// 本进程是否发生过 D32S8->D24S8 透明替换。
+/// 用于命令层热路径短路: 没有游戏做过替换 (Undertale/D3D9 等原生 D24S8 或纯颜色游戏)
+/// 时, 映射表必然为空, 命令钩子无需每次 RwLock+HashMap 查找, 直接走全局 device 转发
+/// (等价于"查空表", 但开销≈C 版无钩子)。一次性置位、永不复位, 无竞态:
+/// 被替换的图像必先在此置位后才可能被命令引用。
+static SUBSTITUTION_HAPPENED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn mark_substitution() {
+    SUBSTITUTION_HAPPENED.store(true, Ordering::Relaxed);
+}
+
+#[inline]
+fn substitution_happened() -> bool {
+    SUBSTITUTION_HAPPENED.load(Ordering::Relaxed)
+}
+
 #[inline]
 fn image_real_entry(image: VkImage) -> Option<(VkFormat, VkDevice)> {
     IMAGE_FORMAT_MAP.read().ok()?.get(&image).copied()
@@ -386,8 +404,15 @@ fn image_is_substituted(image: VkImage) -> bool {
 /// (Undertale/D3D9) 不触发任何替换、地图为空, 命令层也能解析到真实函数指针,
 /// 从而**绝不丢弃** vkCmdCopy/Blit/Resolve/ClearDepth 调用 —— 旧实现查不到
 /// 图像就直接 return, 把整条命令吞掉, 正是黑屏根因。
+///
+/// 短路: 本进程从未发生过替换时, 映射表必然为空, image_is_substituted 对全部图像
+/// 恒为 false, 查表结果等价于"查不到"; 此时直接返回全局 device, 跳过 RwLock+HashMap
+/// 查找, 使非 D32S8 游戏的命令层开销≈C 版无钩子。
 #[inline]
 fn cmd_device(src: VkImage, dst: VkImage) -> Option<VkDevice> {
+    if !substitution_happened() {
+        return crate::global_device();
+    }
     image_real_entry(src)
         .or_else(|| image_real_entry(dst))
         .map(|(_, d)| d)
@@ -412,6 +437,7 @@ pub unsafe extern "C" fn shim_create_image(
     // 对它做多余的伪装处理 -> 黑屏。故必须以"原始请求格式"区分, 与 C 版一致。
     let substituted_d32 = !raw_test() && info.format == DEPTH_D32S8;
     if substituted_d32 {
+        mark_substitution();
         ci.format = DEPTH_D24S8;
         crate::shim_dbg!(
             "D32S8->D24S8 image sub: type={} tiling={} usage=0x{:x} samples={}",
