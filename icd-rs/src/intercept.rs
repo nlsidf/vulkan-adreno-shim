@@ -8,7 +8,8 @@ use crate::ffi::*;
 use crate::memalias;
 use crate::raw_test;
 use core::ptr::null_mut;
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
 
 /* ---- 扩展白名单/黑名单 (同 C 版) ---- */
 
@@ -148,6 +149,44 @@ pub type PFN_create_renderpass2 = unsafe extern "C" fn(
 ) -> i32;
 pub type PFN_destroy_device =
     unsafe extern "C" fn(VkDevice, *const VkAllocationCallbacks);
+pub type PFN_destroy_image =
+    unsafe extern "C" fn(VkDevice, VkImage, *const VkAllocationCallbacks);
+pub type PFN_cmd_clear_depth_stencil_image = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    i32, /* VkImageLayout */
+    *const VkClearDepthStencilValue,
+    u32, /* VkImageSubresourceRange count */
+    *const VkImageSubresourceRange,
+);
+pub type PFN_cmd_copy_image = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    i32, /* VkImageLayout */
+    VkImage,
+    i32, /* VkImageLayout */
+    u32, /* region count */
+    *const VkImageCopy,
+);
+pub type PFN_cmd_blit_image = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    i32, /* VkImageLayout */
+    VkImage,
+    i32, /* VkImageLayout */
+    u32, /* region count */
+    *const VkImageBlit,
+    i32, /* VkFilter */
+);
+pub type PFN_cmd_resolve_image = unsafe extern "C" fn(
+    VkCommandBuffer,
+    VkImage,
+    i32, /* VkImageLayout */
+    VkImage,
+    i32, /* VkImageLayout */
+    u32, /* region count */
+    *const VkImageResolve,
+);
 
 /* ---- vkCreateInstance ---- */
 
@@ -311,6 +350,27 @@ pub unsafe extern "C" fn shim_create_device(
 pub const DEPTH_D32S8: i32 = VK_FORMAT_D32_SFLOAT_S8_UINT;
 pub const DEPTH_D24S8: i32 = VK_FORMAT_D24_UNORM_S8_UINT;
 
+/// 命令层一致性表: 记录每个 VkImage 的 *实际* 格式 + 所属设备。
+///
+/// 在 shim_create_image 中, 若应用请求 D32S8, 我们透明替换为 D24S8 创建,
+/// 并把 (image -> (DEPTH_D24S8, device)) 写入此表。命令层
+/// (vkCmdClearDepthStencilImage 等) 据此判断图像的真实布局并解析真实函数。
+/// VK_TEST_RAW 模式下不写入。
+///
+/// 用 RwLock: 读多写少 (命令执行是热路径, 只读), 创建/销毁时才写。
+static IMAGE_FORMAT_MAP: LazyLock<RwLock<HashMap<VkImage, (VkFormat, VkDevice)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[inline]
+fn image_real_entry(image: VkImage) -> Option<(VkFormat, VkDevice)> {
+    IMAGE_FORMAT_MAP.read().ok()?.get(&image).copied()
+}
+
+#[inline]
+fn image_is_substituted(image: VkImage) -> bool {
+    image_real_entry(image).is_some_and(|(f, _)| f == DEPTH_D24S8)
+}
+
 pub unsafe extern "C" fn shim_create_image(
     device: VkDevice,
     p_create_info: *const VkImageCreateInfo,
@@ -322,6 +382,8 @@ pub unsafe extern "C" fn shim_create_image(
     };
     let info = unsafe { &*p_create_info };
     let mut ci = *info;
+    // 完美伪装: 应用请求 D32S8 时, 透明替换成硬件真正支持的 D24S8 创建。
+    // 创建成功后把实际格式记入映射表, 供命令层 (清除/拷贝等) 判断真实布局。
     if !raw_test() && ci.format == DEPTH_D32S8 {
         ci.format = DEPTH_D24S8;
         crate::shim_dbg!(
@@ -332,7 +394,23 @@ pub unsafe extern "C" fn shim_create_image(
             ci.samples
         );
     }
+    // 诊断: verbose>=2 时记录所有 image 创建格式, 看游戏真实用什么深度格式。
+    if crate::verbose() >= 2 {
+        crate::shim_dbg!(
+            "vkCreateImage: fmt={} type={} tiling={} usage=0x{:x} samples={} (请求原 fmt={})",
+            ci.format, ci.image_type, ci.tiling, ci.usage, ci.samples, info.format
+        );
+    }
     let r = real(device, &ci, p_allocator, p_image);
+    if r == VK_SUCCESS && !p_image.is_null() {
+        let image = *p_image;
+        if ci.format == DEPTH_D24S8 {
+            if let Ok(mut g) = IMAGE_FORMAT_MAP.write() {
+                g.insert(image, (DEPTH_D24S8, device));
+                crate::shim_dbg!("record image {:p} -> D24S8 (dev {:p})", image, device);
+            }
+        }
+    }
     if r != VK_SUCCESS {
         crate::shim_log!(
             "vkCreateImage FAILED fmt={} type={} tiling={} usage=0x{:x} samples={} r={}",
@@ -358,6 +436,7 @@ pub unsafe extern "C" fn shim_create_image_view(
     };
     let info = unsafe { &*p_create_info };
     let mut ci = *info;
+    // 完美伪装: 视图格式同步替换, 与 image 保持一致。
     if !raw_test() && ci.format == DEPTH_D32S8 {
         ci.format = DEPTH_D24S8;
         crate::shim_dbg!("D32S8->D24S8 view sub");
@@ -433,6 +512,193 @@ pub unsafe extern "C" fn shim_create_renderpass2(
     real(device, &ci, p_allocator, p_render_pass)
 }
 
+/* ---- vkDestroyImage: 清理命令层映射表 ---- */
+
+pub unsafe extern "C" fn shim_destroy_image(
+    device: VkDevice,
+    image: VkImage,
+    p_allocator: *const VkAllocationCallbacks,
+) {
+    if !IMAGE_FORMAT_MAP.read().map_or(true, |m| m.is_empty()) {
+        if let Ok(mut g) = IMAGE_FORMAT_MAP.write() {
+            g.remove(&image);
+        }
+    }
+    if let Some(real) = crate::dev_fns_global(device).destroy_image {
+        real(device, image, p_allocator);
+    }
+}
+
+/* ---- 命令层拦截 ---- */
+
+/// 把 [0,1] 范围的 D32S8 浮点深度值 clamp 到合法区间。
+/// 由于我们在创建层已将图像替换成 D24S8 (应用按 D32S8 语义提交), 但 Vulkan
+/// 驱动按 D24S8 解析 VkClearDepthStencilValue.depth 字段时, 仍把它当 0..1 浮点
+/// 处理 (D24 内部归一化), 因此只需 clamp 即可, 无需做 d32*d24max 整数换算。
+#[inline]
+fn clamp01(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
+}
+
+pub unsafe extern "C" fn shim_cmd_clear_depth_stencil_image(
+    command_buffer: VkCommandBuffer,
+    image: VkImage,
+    image_layout: i32,
+    p_clear_value: *const VkClearDepthStencilValue,
+    range_count: u32,
+    p_ranges: *const VkImageSubresourceRange,
+) {
+    let Some(entry) = image_real_entry(image) else {
+        return;
+    };
+    let (_, device) = entry;
+    let Some(real) = crate::dev_fns_global(device).cmd_clear_depth_stencil_image else {
+        return;
+    };
+    // 仅当图像被我们替换成 D24S8 时才需处理。
+    if !raw_test() && image_is_substituted(image) && !p_clear_value.is_null() {
+        let cv = &*p_clear_value;
+        crate::shim_dbg!(
+            "CmdClearDepthStencilImage: 图像={:p} 原 D32S8 clear depth={} stencil={}",
+            image,
+            cv.depth,
+            cv.stencil
+        );
+        // depth 按 0..1 浮点 clamp 后透传 (驱动按 D24S8 解析即正确);
+        // stencil 8-bit 直接透传。这里就地构造一份 clamp 后的副本。
+        let fixed = VkClearDepthStencilValue {
+            depth: clamp01(cv.depth),
+            stencil: cv.stencil,
+        };
+        real(
+            command_buffer,
+            image,
+            image_layout,
+            &fixed,
+            range_count,
+            p_ranges,
+        );
+        return;
+    }
+    real(
+        command_buffer,
+        image,
+        image_layout,
+        p_clear_value,
+        range_count,
+        p_ranges,
+    );
+}
+
+pub unsafe extern "C" fn shim_cmd_copy_image(
+    command_buffer: VkCommandBuffer,
+    src_image: VkImage,
+    src_layout: i32,
+    dst_image: VkImage,
+    dst_layout: i32,
+    region_count: u32,
+    p_regions: *const VkImageCopy,
+) {
+    let Some(device) = image_real_entry(src_image).map(|(_, d)| d).or_else(|| {
+        image_real_entry(dst_image).map(|(_, d)| d)
+    }) else {
+        return;
+    };
+    let Some(real) = crate::dev_fns_global(device).cmd_copy_image else {
+        return;
+    };
+    // 创建层已统一替换: 所有图像的实际格式一致 (D24S8), 数据布局匹配,
+    // 直接透传。仅防御性诊断记录。
+    if !raw_test() && (image_is_substituted(src_image) || image_is_substituted(dst_image)) {
+        crate::shim_dbg!(
+            "CmdCopyImage: src={:p} dst={:p} (D24S8 同布局, 透传)",
+            src_image,
+            dst_image
+        );
+    }
+    real(
+        command_buffer,
+        src_image,
+        src_layout,
+        dst_image,
+        dst_layout,
+        region_count,
+        p_regions,
+    );
+}
+
+pub unsafe extern "C" fn shim_cmd_blit_image(
+    command_buffer: VkCommandBuffer,
+    src_image: VkImage,
+    src_layout: i32,
+    dst_image: VkImage,
+    dst_layout: i32,
+    region_count: u32,
+    p_regions: *const VkImageBlit,
+    filter: i32,
+) {
+    let Some(device) = image_real_entry(src_image).map(|(_, d)| d).or_else(|| {
+        image_real_entry(dst_image).map(|(_, d)| d)
+    }) else {
+        return;
+    };
+    let Some(real) = crate::dev_fns_global(device).cmd_blit_image else {
+        return;
+    };
+    if !raw_test() && (image_is_substituted(src_image) || image_is_substituted(dst_image)) {
+        crate::shim_dbg!(
+            "CmdBlitImage: src={:p} dst={:p} (D24S8 同布局, 透传)",
+            src_image,
+            dst_image
+        );
+    }
+    real(
+        command_buffer,
+        src_image,
+        src_layout,
+        dst_image,
+        dst_layout,
+        region_count,
+        p_regions,
+        filter,
+    );
+}
+
+pub unsafe extern "C" fn shim_cmd_resolve_image(
+    command_buffer: VkCommandBuffer,
+    src_image: VkImage,
+    src_layout: i32,
+    dst_image: VkImage,
+    dst_layout: i32,
+    region_count: u32,
+    p_regions: *const VkImageResolve,
+) {
+    let Some(device) = image_real_entry(src_image).map(|(_, d)| d).or_else(|| {
+        image_real_entry(dst_image).map(|(_, d)| d)
+    }) else {
+        return;
+    };
+    let Some(real) = crate::dev_fns_global(device).cmd_resolve_image else {
+        return;
+    };
+    if !raw_test() && (image_is_substituted(src_image) || image_is_substituted(dst_image)) {
+        crate::shim_dbg!(
+            "CmdResolveImage: src={:p} dst={:p} (D24S8 同布局, 透传)",
+            src_image,
+            dst_image
+        );
+    }
+    real(
+        command_buffer,
+        src_image,
+        src_layout,
+        dst_image,
+        dst_layout,
+        region_count,
+        p_regions,
+    );
+}
+
 /* ---- vkGetDeviceProcAddr ---- */
 
 pub unsafe extern "C" fn shim_get_device_proc_addr(
@@ -471,6 +737,23 @@ pub unsafe extern "C" fn shim_get_device_proc_addr(
         && (fns.create_renderpass2.is_some() || fns.create_renderpass2khr.is_some())
     {
         return to_void_fn(shim_create_renderpass2 as PFN_create_renderpass2);
+    }
+    if name == b"vkDestroyImage" && fns.destroy_image.is_some() {
+        return to_void_fn(shim_destroy_image as PFN_destroy_image);
+    }
+    if name == b"vkCmdClearDepthStencilImage" && fns.cmd_clear_depth_stencil_image.is_some() {
+        return to_void_fn(
+            shim_cmd_clear_depth_stencil_image as PFN_cmd_clear_depth_stencil_image,
+        );
+    }
+    if name == b"vkCmdCopyImage" && fns.cmd_copy_image.is_some() {
+        return to_void_fn(shim_cmd_copy_image as PFN_cmd_copy_image);
+    }
+    if name == b"vkCmdBlitImage" && fns.cmd_blit_image.is_some() {
+        return to_void_fn(shim_cmd_blit_image as PFN_cmd_blit_image);
+    }
+    if name == b"vkCmdResolveImage" && fns.cmd_resolve_image.is_some() {
+        return to_void_fn(shim_cmd_resolve_image as PFN_cmd_resolve_image);
     }
     if name == b"vkDestroyDevice" && fns.destroy_device.is_some() {
         return to_void_fn(shim_destroy_device as PFN_destroy_device);

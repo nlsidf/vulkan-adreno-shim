@@ -31,9 +31,10 @@ use core::ptr::null_mut;
 use std::sync::{Mutex, OnceLock};
 
 pub use intercept::{
-    PFN_create_device, PFN_create_image, PFN_create_image_view, PFN_create_instance,
-    PFN_create_renderpass, PFN_create_renderpass2, PFN_destroy_device, PFN_enum_pds,
-    PFN_get_dev_proc, PFN_get_mem_props,
+    PFN_cmd_blit_image, PFN_cmd_copy_image, PFN_cmd_clear_depth_stencil_image,
+    PFN_cmd_resolve_image, PFN_create_device, PFN_create_image, PFN_create_image_view,
+    PFN_create_instance, PFN_create_renderpass, PFN_create_renderpass2, PFN_destroy_device,
+    PFN_destroy_image, PFN_enum_pds, PFN_get_dev_proc, PFN_get_mem_props,
 };
 
 /* ================= 环境开关 ================= */
@@ -57,6 +58,21 @@ pub fn env_int(name: &core::ffi::CStr) -> i32 {
 static RAW_TEST: OnceLock<bool> = OnceLock::new();
 pub fn raw_test() -> bool {
     *RAW_TEST.get_or_init(|| env_flag(c"VK_TEST_RAW"))
+}
+
+/// VK_ICD_RTV_FIX=1: 对"可采样但缺 COLOR_ATTACHMENT"的颜色格式补 COLOR_ATTACHMENT
+/// 能力位。该补位仅 星白列车(星空列车与白的旅行) 等个别 2D 游戏需要；对其他游戏
+/// (如 Undertale) 反而会因谎报能力位导致黑屏。故默认关闭, 只在该游戏脚本里显式开启。
+static RTV_FIX: OnceLock<bool> = OnceLock::new();
+pub fn rtv_fix() -> bool {
+    *RTV_FIX.get_or_init(|| env_flag(c"VK_ICD_RTV_FIX"))
+}
+
+/// VK_ICD_BC_FIX=1: 对 BC1~BC7 压缩纹理格式补 SAMPLED+TRANSFER+BLIT 能力位。
+/// 同样仅 星白列车 等个别游戏需要；默认关闭, 只在该游戏脚本里显式开启。
+static BC_FIX: OnceLock<bool> = OnceLock::new();
+pub fn bc_fix() -> bool {
+    *BC_FIX.get_or_init(|| env_flag(c"VK_ICD_BC_FIX"))
 }
 
 /// VK_ICD_VERBOSE>=2: 打开热路径诊断 (默认静默, 见 C 版 1f0ff6d)。
@@ -221,6 +237,24 @@ pub fn ensure_fmtp2_resolved(pd: ffi::VkPhysicalDevice) {
     });
 }
 
+static REAL_IFFP2: OnceLock<Option<fmtfix::PFN_iffp2>> = OnceLock::new();
+pub fn real_iffp2() -> Option<fmtfix::PFN_iffp2> {
+    *REAL_IFFP2.get().unwrap_or(&None)
+}
+pub fn ensure_iffp2_resolved(pd: ffi::VkPhysicalDevice) {
+    let _ = REAL_IFFP2.get_or_init(|| {
+        let get_proc = get_proc_global()?;
+        let owner = inst_for_pd(pd);
+        unsafe {
+            driver::resolve_from_get_proc::<fmtfix::PFN_iffp2>(
+                get_proc,
+                owner,
+                c"vkGetPhysicalDeviceImageFormatProperties2",
+            )
+        }
+    });
+}
+
 /* ================= 设备函数表 ================= */
 
 /// 需要拦截的设备的真实函数, 首次 vkGetDeviceProcAddr 时整体解析。
@@ -246,6 +280,11 @@ pub struct DevFns {
     pub create_renderpass: Option<intercept::PFN_create_renderpass>,
     pub create_renderpass2: Option<intercept::PFN_create_renderpass2>,
     pub create_renderpass2khr: Option<intercept::PFN_create_renderpass2>,
+    pub destroy_image: Option<intercept::PFN_destroy_image>,
+    pub cmd_clear_depth_stencil_image: Option<intercept::PFN_cmd_clear_depth_stencil_image>,
+    pub cmd_copy_image: Option<intercept::PFN_cmd_copy_image>,
+    pub cmd_blit_image: Option<intercept::PFN_cmd_blit_image>,
+    pub cmd_resolve_image: Option<intercept::PFN_cmd_resolve_image>,
     pub destroy_device: Option<
         unsafe extern "C" fn(ffi::VkDevice, *const ffi::VkAllocationCallbacks),
     >,
@@ -267,6 +306,11 @@ impl DevFns {
             create_renderpass: None,
             create_renderpass2: None,
             create_renderpass2khr: None,
+            destroy_image: None,
+            cmd_clear_depth_stencil_image: None,
+            cmd_copy_image: None,
+            cmd_blit_image: None,
+            cmd_resolve_image: None,
             destroy_device: None,
         }
     }
@@ -313,6 +357,19 @@ fn init_dev_fns(device: ffi::VkDevice) -> DevFns {
             driver::resolve_from_get_dev_proc(get_dev, device, c"vkCreateRenderPass2");
         fns.create_renderpass2khr =
             driver::resolve_from_get_dev_proc(get_dev, device, c"vkCreateRenderPass2KHR");
+        fns.destroy_image =
+            driver::resolve_from_get_dev_proc(get_dev, device, c"vkDestroyImage");
+        fns.cmd_clear_depth_stencil_image = driver::resolve_from_get_dev_proc(
+            get_dev,
+            device,
+            c"vkCmdClearDepthStencilImage",
+        );
+        fns.cmd_copy_image =
+            driver::resolve_from_get_dev_proc(get_dev, device, c"vkCmdCopyImage");
+        fns.cmd_blit_image =
+            driver::resolve_from_get_dev_proc(get_dev, device, c"vkCmdBlitImage");
+        fns.cmd_resolve_image =
+            driver::resolve_from_get_dev_proc(get_dev, device, c"vkCmdResolveImage");
         fns.destroy_device =
             driver::resolve_from_get_dev_proc(get_dev, device, c"vkDestroyDevice");
     }
@@ -520,6 +577,11 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     if name == b"vkGetPhysicalDeviceFormatProperties2" {
         return driver::to_void_fn(fmtfix::shim_fmtp2 as fmtfix::PFN_fmtp2);
     }
+    if name == b"vkGetPhysicalDeviceImageFormatProperties2"
+        || name == b"vkGetPhysicalDeviceImageFormatProperties2KHR"
+    {
+        return driver::to_void_fn(fmtfix::shim_iffp2 as fmtfix::PFN_iffp2);
+    }
     get_proc(instance, p_name)
 }
 
@@ -545,6 +607,11 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
     }
     if name == b"vkGetPhysicalDeviceFormatProperties2" {
         return driver::to_void_fn(fmtfix::shim_fmtp2 as fmtfix::PFN_fmtp2);
+    }
+    if name == b"vkGetPhysicalDeviceImageFormatProperties2"
+        || name == b"vkGetPhysicalDeviceImageFormatProperties2KHR"
+    {
+        return driver::to_void_fn(fmtfix::shim_iffp2 as fmtfix::PFN_iffp2);
     }
     /* 其余 PD 级函数按 pName 交给驱动 dispatcher */
     get_proc(physical_device as ffi::VkInstance, p_name)

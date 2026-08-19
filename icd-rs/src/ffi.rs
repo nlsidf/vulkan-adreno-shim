@@ -39,6 +39,7 @@ pub type VkBuffer = Handle;
 pub type VkImage = Handle;
 pub type VkImageView = Handle;
 pub type VkRenderPass = Handle;
+pub type VkCommandBuffer = Handle;
 
 /* ---- 基础类型 ---- */
 pub type VkResult = i32;
@@ -86,6 +87,24 @@ pub const VK_FORMAT_D16_UNORM_S8_UINT: i32 = 128;
 pub const VK_FORMAT_D24_UNORM_S8_UINT: i32 = 129;
 pub const VK_FORMAT_D32_SFLOAT_S8_UINT: i32 = 130;
 
+/* VkFormat (BC 压缩纹理格式, Adreno 540 HAL 报 0 能力位但硬件支持) */
+pub const VK_FORMAT_BC1_RGB_UNORM_BLOCK: i32 = 131;
+pub const VK_FORMAT_BC1_RGB_SRGB_BLOCK: i32 = 132;
+pub const VK_FORMAT_BC1_RGBA_UNORM_BLOCK: i32 = 133;
+pub const VK_FORMAT_BC1_RGBA_SRGB_BLOCK: i32 = 134;
+pub const VK_FORMAT_BC2_UNORM_BLOCK: i32 = 135;
+pub const VK_FORMAT_BC2_SRGB_BLOCK: i32 = 136;
+pub const VK_FORMAT_BC3_UNORM_BLOCK: i32 = 137;
+pub const VK_FORMAT_BC3_SRGB_BLOCK: i32 = 138;
+pub const VK_FORMAT_BC4_UNORM_BLOCK: i32 = 139;
+pub const VK_FORMAT_BC4_SNORM_BLOCK: i32 = 140;
+pub const VK_FORMAT_BC5_UNORM_BLOCK: i32 = 141;
+pub const VK_FORMAT_BC5_SNORM_BLOCK: i32 = 142;
+pub const VK_FORMAT_BC6H_UFLOAT_BLOCK: i32 = 143;
+pub const VK_FORMAT_BC6H_SFLOAT_BLOCK: i32 = 144;
+pub const VK_FORMAT_BC7_UNORM_BLOCK: i32 = 145;
+pub const VK_FORMAT_BC7_SRGB_BLOCK: i32 = 146;
+
 /* VkImageUsageFlagBits */
 pub const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
 pub const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
@@ -95,11 +114,22 @@ pub const VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT: u32 = 0x0000_0080;
 
 /* VkFormatFeatureFlagBits */
 pub const VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT: u32 = 0x0000_0001;
+pub const VK_FORMAT_FEATURE_TRANSFER_SRC_BIT: u32 = 0x0000_0010;
+pub const VK_FORMAT_FEATURE_TRANSFER_DST_BIT: u32 = 0x0000_0020;
+pub const VK_FORMAT_FEATURE_BLIT_SRC_BIT: u32 = 0x0000_0040;
+pub const VK_FORMAT_FEATURE_BLIT_DST_BIT: u32 = 0x0000_0080;
+pub const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT: u32 = 0x0000_0100;
+pub const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT: u32 = 0x0000_0400;
 pub const VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT: u32 = 0x0000_0200;
 
 /* VkFormatFeatureFlagBits2 (VkFormatProperties3KHR, 64-bit) */
 pub const VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT: u64 = 0x1;
+pub const VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT: u64 = 0x80;
 pub const VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT: u64 = 0x200;
+pub const VK_FORMAT_FEATURE_2_BLIT_SRC_BIT: u64 = 0x40;
+pub const VK_FORMAT_FEATURE_2_BLIT_DST_BIT: u64 = 0x80_0000;
+pub const VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT: u64 = 0x1000_0000;
+pub const VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT: u64 = 0x2000_0000;
 
 /* VkMemoryPropertyFlagBits */
 pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x0000_0002;
@@ -635,4 +665,105 @@ const _: () = {
     assert!(size_of::<VkAttachmentDescription2>() == 56);
     assert!(size_of::<VkRenderPassCreateInfo>() == 64);
     assert!(size_of::<VkRenderPassCreateInfo2>() == 80);
+};
+
+/* ---- 命令层 (D32S8 透明替换需要拦截的拷贝/清除命令) ---- */
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkOffset3D {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageSubresourceLayers {
+    pub aspect_mask: u32,
+    pub mip_level: u32,
+    pub base_array_layer: u32,
+    pub layer_count: u32,
+}
+
+/// VkClearDepthStencilValue: depth 为 32-bit 浮点 (即使底层存储是 D24),
+/// stencil 为 8-bit 无符号。这是应用按 D32S8 语义填充的清除值。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkClearDepthStencilValue {
+    pub depth: f32,
+    pub stencil: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageCopy {
+    pub src_subresource: VkImageSubresourceLayers,
+    pub src_offset: VkOffset3D,
+    pub dst_subresource: VkImageSubresourceLayers,
+    pub dst_offset: VkOffset3D,
+    pub extent: VkExtent3D,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageBlit {
+    pub src_subresource: VkImageSubresourceLayers,
+    pub src_offsets: [VkOffset3D; 2],
+    pub dst_subresource: VkImageSubresourceLayers,
+    pub dst_offsets: [VkOffset3D; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageResolve {
+    pub src_subresource: VkImageSubresourceLayers,
+    pub src_offset: VkOffset3D,
+    pub dst_subresource: VkImageSubresourceLayers,
+    pub dst_offset: VkOffset3D,
+    pub extent: VkExtent3D,
+}
+
+/* ---- 命令层结构编译期布局断言 ---- */
+
+const _: () = {
+    use core::mem::size_of;
+
+    assert!(size_of::<VkOffset3D>() == 12);
+    assert!(size_of::<VkImageSubresourceLayers>() == 16);
+    assert!(size_of::<VkClearDepthStencilValue>() == 8);
+    assert!(size_of::<VkImageCopy>() == 68);
+    assert!(size_of::<VkImageBlit>() == 80);
+    assert!(size_of::<VkImageResolve>() == 68);
+};
+
+/* ---- vkGetPhysicalDeviceImageFormatProperties2 (DXVK 实际走的探测路径) ---- */
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkPhysicalDeviceImageFormatInfo2 {
+    pub s_type: VkStructureType,
+    pub p_next: *const c_void,
+    pub format: VkFormat,
+    pub image_type: i32,
+    pub tiling: i32,
+    pub usage: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkImageFormatProperties2 {
+    pub s_type: VkStructureType,
+    pub p_next: *mut c_void,
+    pub image_format_properties: VkImageFormatProperties,
+}
+
+/* ---- ImageFormatProperties2 结构编译期布局断言 ---- */
+
+const _: () = {
+    use core::mem::offset_of;
+
+    assert!(offset_of!(VkPhysicalDeviceImageFormatInfo2, format) == 16);
+    assert!(offset_of!(VkImageFormatProperties2, image_format_properties) == 16);
 };
