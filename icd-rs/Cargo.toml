@@ -1,0 +1,20 @@
+[package]
+name = "vulkan-adreno-icd"
+version = "0.1.0"
+edition = "2021"
+description = "Adreno Vulkan ICD shim (Rust rewrite of icd/vulkan_adreno_icd.c)"
+license = "MIT"
+
+[lib]
+name = "vulkan_adreno_icd"
+crate-type = ["cdylib"]
+
+# 零第三方依赖: 所有 libc/Vulkan 类型手写 FFI, 与 C 原版一致
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
