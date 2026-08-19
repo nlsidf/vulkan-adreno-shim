@@ -525,7 +525,7 @@ pub unsafe extern "C" fn shim_free_memory(
     p_allocator: *const VkAllocationCallbacks,
 ) {
     /* 写锁摘 entry, 把要释放的资源拷贝出来, syscall 全部在锁外 */
-    let (target, lo, len, fd, need_unmap) = {
+    let (target, lo, len, fd, map_count) = {
         let mut g = write_alias();
         let Some(e) = g.remove(&memory) else {
             /* 未被接管的内存: 原样透传 */
@@ -540,14 +540,18 @@ pub unsafe extern "C" fn shim_free_memory(
             e.lo.load(Ordering::Acquire),
             e.len.load(Ordering::Relaxed),
             e.fd.load(Ordering::Relaxed),
-            e.hal_map_count.load(Ordering::Relaxed) > 0,
+            e.hal_map_count.load(Ordering::Relaxed),
         )
     };
 
-    /* 防御: 应用未 unmap 就 free (DXVK 有此模式), HAL 映射要还掉 */
-    if need_unmap {
+    /* 防御: 应用未 unmap 就 free (DXVK 有此模式)。HAL 的每次 map 都要配对还回去:
+     * map_count 可能是多次 vkMapMemory 的累积, 只还一次会漏掉其余 HAL 映射
+     * (显存泄漏), 故循环到归零。 */
+    if map_count > 0 {
         if let Some(unmap) = crate::dev_fns_global(device).unmap_memory {
-            unmap(device, memory);
+            for _ in 0..map_count {
+                unmap(device, memory);
+            }
         }
     }
     if !lo.is_null() {
@@ -570,17 +574,19 @@ pub unsafe extern "C" fn shim_free_memory(
 
 pub unsafe fn cleanup_device(device: VkDevice) {
     let fns = crate::dev_fns_global(device);
-    let mut victims: Vec<(VkBuffer, *mut c_void, usize, i32)> = Vec::new();
+    let mut victims: Vec<(VkDeviceMemory, VkBuffer, *mut c_void, usize, i32, u32)> = Vec::new();
     {
         let mut g = write_alias();
         let mut removed = Vec::new();
         for (mem, e) in g.iter() {
             if e.dev == device {
                 victims.push((
+                    *mem,
                     e.buf,
                     e.lo.load(Ordering::Acquire),
                     e.len.load(Ordering::Relaxed),
                     e.fd.load(Ordering::Relaxed),
+                    e.hal_map_count.load(Ordering::Relaxed),
                 ));
                 removed.push(*mem);
             }
@@ -593,7 +599,15 @@ pub unsafe fn cleanup_device(device: VkDevice) {
         }
     }
     let n = victims.len();
-    for (buf, lo, len, fd) in victims {
+    for (mem, buf, lo, len, fd, map_count) in victims {
+        /* 同样把 outstanding 的 HAL map 全部配对还掉, 再清理 shim 自有资源 */
+        if map_count > 0 {
+            if let Some(unmap) = fns.unmap_memory {
+                for _ in 0..map_count {
+                    unmap(device, mem);
+                }
+            }
+        }
         if !lo.is_null() {
             cffi::munmap(lo, len);
         }
