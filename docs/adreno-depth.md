@@ -116,18 +116,50 @@ Adreno 540 的 Vulkan 驱动 `/vendor/lib64/hw/vulkan.msm8998.so` 是 Android Vu
 
 ### 4. shim 当前生效的修补项（默认开启，游戏正常）
 - `fmtp_fix_depth`：为深度/模板格式补齐能力位；`D32S8` 复制 `D24S8` 的真实能力。
-- `iffp`：放宽深度格式在 `SAMPLED/TRANSFER` 等 usage 下的 `-11`。
-- `vkCreateImage/View/RenderPass`：D32S8→D24S8 透明替换。
-- BC 压缩格式：补 `SAMPLED/TRANSFER/BLIT` 能力位。
-- 颜色格式：若可采样但缺 `COLOR_ATTACHMENT`，补上（修 Unity RenderTexture 颜色缓冲）。
+- `iffp` / `iffp2`：放宽深度格式在 `SAMPLED/TRANSFER` 等 usage 下的 `-11`。
+- `vkCreateImage/View/RenderPass(/2)`：D32S8→D24S8 透明替换（**命令层同步拦截 clear/copy/blit/resolve**，保持 D24S8 一致布局）。
+- **BC 压缩格式补位（门控，默认关闭）**：对 BC1~BC7 补 `SAMPLED/TRANSFER/BLIT`。**仅 `VK_ICD_BC_FIX=1` 时生效**，目前只在 星白列车脚本里开启。
+- **颜色格式 COLOR_ATTACHMENT 补位（门控，默认关闭）**：对「可采样但缺 COLOR_ATTACHMENT」的颜色格式补 `COLOR_ATTACHMENT+BLEND+TRANSFER+BLIT`。**仅 `VK_ICD_RTV_FIX=1` 时生效**，且只在 星白列车脚本里开启。
+  ⚠️ BC 与颜色补位对 **星白列车** 必需（缺失→3D 黑屏有声音），但对 **Undertale / gal 等游戏反而会因谎报能力位导致黑屏**。因此两者都**绝不能无条件开启**——默认全关，只在需要的脚本里打对应开关。
 - `VK_TEST_RAW=1`（仅测试用）：关闭以上所有修补 + 关闭「低位 dmabuf 重映射」。
 - `VK_ICD_MAP_LOW=0`：关闭低位 dmabuf 重映射（原诊断开关）。
+- `VK_ICD_RTV_FIX=1` / `VK_ICD_BC_FIX=1`：**只在需要补位的游戏脚本里设**（目前仅 `claunch-mashiro-adreno.sh`）。
+
+> ⚠️ **历史教训（2026-08-19，四次踩坑，务必记牢）**：
+> - 标本躲猫猫 3D 黑屏根因是 **DXVK shader cache 损坏**（见「急救步骤 0」），与格式能力无关；清 cache 即解决。
+> - 星白列车（星空列车与白的旅行）黑屏**不是** cache 问题，而是缺 **BC 补位 + 颜色 COLOR_ATTACHMENT 补位**。两者都**门控**在开关后（默认关），仅星白脚本里开 `VK_ICD_BC_FIX=1` + `VK_ICD_RTV_FIX=1`。
+> - **BC / 颜色补位都绝不能无条件开启**：曾把它们改成无条件后，Undertale / gal 等原本正常的游戏**集体黑屏**（谎报能力位所致）。正确基线 = 两个补位都默认关闭，只在该开的游戏脚本里打对应开关。
+> - `vulkan_gpu.so`（`LD_PRELOAD` 加载的伞兵）必须与 `vulkan_adreno_icd.so` 保持同一份二进制，每次 Rust 重建后 `cp` 同步。
 
 ---
 
 ## 四、诊断流程（可复用的标准动作）
 
 当某个 Windows 游戏在本环境出现**灰屏 / 黑屏 / 闪烁 / 穿模 / 缺贴图**时，按此顺序排查：
+
+### 步骤 0（最优先！）：先排除 DXVK shader cache 损坏 —— 黑屏却无声、无报错
+> 经验铁律：**「3D 全黑 + UI 文字正常 + 有声音 + 无任何游戏/驱动报错」组合，先怀疑 DXVK cache，而不是 shim 格式修补。**
+> shim 的格式修补若真有缺口，通常会伴随 `vkCreateImage FAILED` / `iffp r=-11` 日志或 Unity `RenderTexture.Create failed`；
+> **cache 损坏则完全静默**——DXVK 加载了坏 pipeline 缓存，3D 管线静默失败，渲染出来就是一片黑，但游戏逻辑/UI 照常。
+
+排查动作（极低成本，先试这个再动代码）：
+1. 关掉游戏（必要时 `pgrep -f SPECIMEN | xargs kill -9`，**不要用 `pkill -f` 误杀本 shell**）。
+2. 备份并删除该游戏的 DXVK cache：
+   ```
+   DXVK_CACHE="$HOME/proton11/p11prefix/drive_d/users/xuser/AppData/Local/dxvk/<游戏名>.dxvk-cache"
+   cp -f "$DXVK_CACHE" "$DXVK_CACHE.bak"   # 先备份，可恢复
+   rm -f "$DXVK_CACHE"
+   ```
+   - 文件名形如 `SPECIMEN_HIDE_SEEK.dxvk-cache` / `星空列车与白的旅行.dxvk-cache` / `nine_kokoiro.dxvk-cache` 等，
+     命名规则 = Unity 产品名（Player.log 同目录名）。不确定时 `ls -lt ~/.../Local/dxvk/` 看最近改动的那一个。
+3. 重开游戏。DXVK 会重建一份干净的 cache（大小通常从「异常大/异常小」回到几 KB～十几 KB）。
+   - **若重建后 3D 立刻恢复 → 根因就是坏 cache，与 shim 无关**，不必再改格式修补。
+   - 备份的 `.bak` 可留作证据，确认恢复后可删。
+
+> 真实案例（2026-08-19）：标本躲猫猫 3D 全黑无轮廓、UI/声音正常、无报错。
+> 一度怀疑 BC 压缩贴图 / 颜色 COLOR_ATTACHMENT 能力缺失并加了补位，实测无效；
+> 最终删除 `SPECIMEN_HIDE_SEEK.dxvk-cache`（当时 12552 字节、已损坏）后，C 版与 Rust 版 ICD **同时**恢复 3D 画面。
+> 结论：BC / 颜色补位都不是根因，纯属误打误撞之外的负优化，已全部回退。
 
 ### 步骤 A：抓两份日志
 启动游戏前清空日志，运行 ~40 秒后分析：
@@ -180,11 +212,11 @@ export VK_TEST_RAW=1
 - 编译：`gcc <file>.c -o <file> -lvulkan -I/data/data/com.termux/files/usr/include`（着色器先用 `glslangValidator -V` 编译成 `.spv`）。
 
 ### 步骤 E：施加修复（在 shim 里）
+> 先确认已经过「步骤 0（DXVK cache）」与「步骤 C（能力 vs 创建）」定位，再动代码。
 确认坏格式后，照下面任一类方式补：
-- **深度/模板**：在 `fmtp_fix_depth` 补能力位；在 `iffp` 放宽 `-11`；必要时在 `vkCreateImage/View/RenderPass` 做**等价格式替换**（必须三处一致）。
-- **BC 压缩**：在 `fmtp_fix_depth` 的 BC 分支补 `SAMPLED/TRANSFER/BLIT`；`iffp` 放宽 BC 的 `-11`。
-- **颜色格式缺 COLOR_ATTACHMENT**：在 `fmtp_fix_depth` 末尾的通用分支补位。
-- 改完 `gcc -shared -fPIC -o vulkan_adreno_icd.so vulkan_adreno_icd.c -ldl`，并 `cp -f` 同步到 `vulkan_gpu.so`。
+- **深度/模板**：在 `fmtp_fix_depth` 补能力位；在 `iffp`/`iffp2` 放宽 `-11`；必要时在 `vkCreateImage/View/RenderPass(/2)` 做**等价格式替换**（必须三处一致，命令层 clear/copy/blit/resolve 也要同步）。
+- **BC 压缩**：`fmtp_fix_depth` 的 BC 分支补 `SAMPLED/TRANSFER/BLIT`；`fmtp_fix_depth_pnext` 补 `2KHR` 的 `COLOR_ATTACHMENT|SAMPLED`。`iffp`/`iffp2` 放宽 BC 的 `-11`。**注意 BC 补位对星白列车等游戏是必需的，不要为「标本只需清 cache」而整体回退 BC 补位**（历史坑：曾因此让星白回归黑屏）。
+- Rust 版改完：在 `icd-rs/` 下 `bash build.sh`（clippy 零警告 + 构建），自动安装到 `~/proton11/.build/vulkan_adreno_icd.so`。
 
 ---
 
@@ -195,10 +227,11 @@ export VK_TEST_RAW=1
 - 唯一理论例外：某游戏硬性要求 32 位浮点深度精度（超大型开放世界用对数深度才可能需要），D24S8 的 24 位可能轻微 z-fighting。但 99% 的游戏 D24S8 完全够用。
 
 ### 2. 「这类问题」（老 Adreno 的能力缺口）可能在别的游戏再现
-Adreno 540（a5x）是很老的 Vulkan 实现，HAL 会对不少格式/特性漏报或错报能力位。已碰到过：
-- 深度格式 D32S8（已修）
-- BC 压缩格式 BC1–BC7（已放宽）
-- 部分可选颜色格式（已补 COLOR_ATTACHMENT）
+Adreno 540（a5x）是很老的 Vulkan 实现，HAL 会对不少格式/特性漏报或错报能力位。已确认并修复：
+- 深度格式 D32S8（已修，透明替换为 D24S8）
+- BC 压缩格式 BC1–BC7（已补 `SAMPLED/TRANSFER/BLIT`，**星白列车等 2D 游戏必需**）
+
+> 颜色 COLOR_ATTACHMENT 补位（`VK_ICD_RTV_FIX`）仍维持移除：对标本无效（真因是 DXVK cache）、对星白无必要。
 
 **未来别的游戏**可能遇到：没覆盖到的某个格式、某个特性位（如 `geometryShader`、`logicOp`、`sampleRateShading`）、某种 MSAA 采样数、某个扩展等。
 
@@ -222,10 +255,10 @@ Adreno 540（a5x）是很老的 Vulkan 实现，HAL 会对不少格式/特性漏
 
 | 文件 | 作用 |
 |------|------|
-| `~/proton11/.build/vulkan_adreno_icd.c` | shim 源码（所有修补点都在这里） |
-| `~/proton11/.build/vulkan_adreno_icd.so` | 编译产物，ICD 实际加载对象 |
-| `~/proton11/.build/vulkan_gpu.so` | shim 的 LD_PRELOAD 副本（需与 .so 同步） |
-| `~/proton11/.build/vulkan_adreno_icd.json` | ICD 描述，指向上面的 .so |
+| `~/proton11/.build/vulkan_adreno_icd.c` | C shim 参考源码（与 Rust 版逻辑一致；仅作对照） |
+| `~/proton11/.build/vulkan_adreno_icd.so` | Rust 版编译产物，ICD JSON 实际加载对象（星白以外的游戏走此路径） |
+| `~/proton11/.build/vulkan_gpu.so` | **必须与 `vulkan_adreno_icd.so` 保持同一份二进制**——`*-adreno.sh` 脚本经 `LD_PRELOAD` 加载它，且它也导出 `vk_icdGetInstanceProcAddr`。每次 Rust 重建后必须 `cp vulkan_adreno_icd.so vulkan_gpu.so`，否则星白等游戏仍跑旧 C 二进制、所有改动失效 |
+| `~/proton11/.build/vulkan_adreno_icd.json` | ICD 描述，指向 `vulkan_adreno_icd.so` |
 | `标本躲猫猫.sh` | 游戏启动脚本（`/data/data/com.termux/files/home/basement/loveai/SPECIMEN_HIDE_SEEK_v1.0.0/`） |
 | `~/proton11/p11prefix/drive_d/users/xuser/AppData/LocalLow/Rain_Without_Sound/SPECIMEN_HIDE_SEEK/Player.log` | Unity 日志 |
 | `~/proton11/.build/adreno-specimen.log` | shim 诊断日志 |
