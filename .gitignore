@@ -3,6 +3,6 @@
 *.o
 *.a
 *.so
-
+.codebuddy/
 # Rust crate 构建缓存
 icd-rs/target/
