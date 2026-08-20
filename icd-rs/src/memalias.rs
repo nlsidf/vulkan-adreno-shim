@@ -577,13 +577,15 @@ pub unsafe extern "C" fn shim_free_memory(
     if fd >= 0 {
         cffi::close(fd);
     }
-    if let Some(free) = crate::dev_fns_global(device).free_memory {
-        free(device, memory, p_allocator);
-    }
+    /* Vulkan 规范: 绑定到内存对象的资源 (靶子 buffer) 必须先于内存对象销毁。
+     * 故 destroy_buffer 必须在 free_memory 之前, 否则驱动可能崩溃或 UB。 */
     if !target.is_null()
         && let Some(destroy) = crate::dev_fns_global(device).destroy_buffer
     {
         destroy(device, target, null_mut());
+    }
+    if let Some(free) = crate::dev_fns_global(device).free_memory {
+        free(device, memory, p_allocator);
     }
 }}
 
