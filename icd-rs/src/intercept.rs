@@ -767,6 +767,16 @@ pub unsafe extern "C" fn shim_get_device_proc_addr(
     if name == b"vkUnmapMemory" && fns.unmap_memory.is_some() {
         return to_void_fn(memalias_shim_unmap_memory as memalias::PFN_unmap);
     }
+    if name == b"vkFlushMappedMemoryRanges" && fns.flush_ranges.is_some() {
+        return to_void_fn(
+            memalias_shim_flush_mapped_memory_ranges as memalias::PFN_flush,
+        );
+    }
+    if name == b"vkInvalidateMappedMemoryRanges" && fns.invalidate_ranges.is_some() {
+        return to_void_fn(
+            memalias_shim_invalidate_mapped_memory_ranges as memalias::PFN_flush,
+        );
+    }
     if name == b"vkAllocateMemory" && fns.alloc_memory.is_some() {
         return to_void_fn(memalias_shim_allocate_memory as memalias::PFN_alloc_mem);
     }
@@ -826,6 +836,8 @@ pub unsafe extern "C" fn shim_destroy_device(
 use crate::memalias::{
     shim_allocate_memory as memalias_shim_allocate_memory,
     shim_free_memory as memalias_shim_free_memory,
+    shim_flush_mapped_memory_ranges as memalias_shim_flush_mapped_memory_ranges,
+    shim_invalidate_mapped_memory_ranges as memalias_shim_invalidate_mapped_memory_ranges,
     shim_map_memory as memalias_shim_map_memory,
     shim_unmap_memory as memalias_shim_unmap_memory,
 };

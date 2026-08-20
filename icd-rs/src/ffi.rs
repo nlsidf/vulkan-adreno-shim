@@ -48,6 +48,19 @@ pub type VkStructureType = i32;
 pub type VkFormat = i32;
 pub type VkSystemAllocationScope = i32;
 pub type VkInternalAllocationType = i32;
+pub type VkDeviceSize = u64;
+
+/// vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges 的元素。
+/// 布局与 vulkan_core.h 的 VkMappedMemoryRange 一致 (s_type, p_next, memory, offset, size)。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkMappedMemoryRange {
+    pub s_type: VkStructureType,
+    pub p_next: *const core::ffi::c_void,
+    pub memory: VkDeviceMemory,
+    pub offset: VkDeviceSize,
+    pub size: VkDeviceSize,
+}
 
 /* ---- 常量 ---- */
 pub const VK_SUCCESS: i32 = 0;

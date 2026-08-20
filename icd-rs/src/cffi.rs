@@ -26,6 +26,11 @@ pub const MAP_ANONYMOUS: c_int = 0x20;
 pub const MAP_NORESERVE: c_int = 0x40;
 pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 
+/* ---- msync ---- */
+pub const MS_ASYNC: c_int = 0x1;
+pub const MS_INVALIDATE: c_int = 0x2;
+pub const MS_SYNC: c_int = 0x4;
+
 /* ---- signal ---- */
 pub const SIGSEGV: c_int = 11;
 pub const SIGBUS: c_int = 7;
@@ -84,6 +89,7 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, length: usize) -> c_int;
+    pub fn msync(addr: *mut c_void, length: usize, flags: c_int) -> c_int;
     pub fn close(fd: c_int) -> c_int;
     pub fn sysconf(name: c_int) -> i64;
 

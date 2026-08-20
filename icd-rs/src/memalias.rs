@@ -22,6 +22,7 @@
 use crate::cffi;
 use crate::ffi::*;
 use crate::dev_fns_global;
+use core::ffi::c_int;
 use core::ptr::null_mut;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
@@ -530,6 +531,86 @@ pub unsafe extern "C" fn shim_unmap_memory(device: VkDevice, memory: VkDeviceMem
     {
         unmap(device, memory);
     }
+}}
+
+/* ---- vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges ---- */
+
+/// 32 位 guest 拿到的是 shim 自己 mmap 的低位映射 (同一 dmabuf fd 的 CPU 视角),
+/// 与驱动内部映射是两份独立 CPU 映射。应用调用 Flush/Invalidate 时, 这些调用
+/// 发往真实驱动, 只作用于驱动侧映射, 不会刷新我们那份低位 mmap 的 CPU 缓存,
+/// 从而在 host-visible (非 coherent) 内存上产生缓存一致性盲区 -> 数据陈旧/错乱。
+/// 解决: 对每段 range, 定位 entry 的低位 lo, 对其 [lo+offset, lo+offset+size]
+/// 区间做 msync, 使我们的 CPU 映射与 dmabuf 后备存储一致。Flush=MS_SYNC 把脏页
+/// 写回后备存储; Invalidate=MS_INVALIDATE 丢弃陈旧缓存行重新从后备存储读。
+/// 同时把原调用转发给真实驱动, 不影响驱动自己那份映射。
+pub type PFN_flush = unsafe extern "C" fn(
+    VkDevice,
+    u32,
+    *const VkMappedMemoryRange,
+) -> i32;
+
+unsafe fn sync_mapped_ranges(
+    device: VkDevice,
+    range_count: u32,
+    p_ranges: *const VkMappedMemoryRange,
+    flags: c_int,
+) -> i32 { unsafe {
+    if ALIAS_ENABLED.load(Ordering::Relaxed) {
+        for i in 0..range_count as usize {
+            let r = &*p_ranges.add(i);
+            let g = read_alias();
+            if let Some(e) = g.get(&r.memory) {
+                let lo = e.lo.load(Ordering::Acquire);
+                if !lo.is_null() {
+                    /* 区间按 mmap 页对齐 (msync 要求) */
+                    let base = lo as usize;
+                    let off = r.offset as usize;
+                    let len_u = if r.size == VK_WHOLE_SIZE {
+                        e.size.saturating_sub(r.offset) as usize
+                    } else {
+                        r.size as usize
+                    };
+                    let start = align_down(base + off, PAGE);
+                    let end = base + off + len_u;
+                    let len = end.saturating_sub(start);
+                    if len > 0 {
+                        cffi::msync(start as *mut c_void, len, flags);
+                    }
+                }
+            }
+        }
+    }
+    /* 转发给真实驱动, 保证其自身映射一致性不变 */
+    let fns = dev_fns_global(device);
+    let real = if flags & cffi::MS_INVALIDATE != 0 {
+        fns.invalidate_ranges
+    } else {
+        fns.flush_ranges
+    };
+    match real {
+        Some(f) => f(device, range_count, p_ranges),
+        None => VK_SUCCESS,
+    }
+}}
+
+fn align_down(v: usize, align: usize) -> usize {
+    v & !(align - 1)
+}
+
+pub unsafe extern "C" fn shim_flush_mapped_memory_ranges(
+    device: VkDevice,
+    range_count: u32,
+    p_ranges: *const VkMappedMemoryRange,
+) -> i32 { unsafe {
+    sync_mapped_ranges(device, range_count, p_ranges, cffi::MS_SYNC)
+}}
+
+pub unsafe extern "C" fn shim_invalidate_mapped_memory_ranges(
+    device: VkDevice,
+    range_count: u32,
+    p_ranges: *const VkMappedMemoryRange,
+) -> i32 { unsafe {
+    sync_mapped_ranges(device, range_count, p_ranges, cffi::MS_SYNC | cffi::MS_INVALIDATE)
 }}
 
 /* ---- vkFreeMemory ---- */

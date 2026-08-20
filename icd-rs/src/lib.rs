@@ -279,6 +279,10 @@ pub fn ensure_iffp2_resolved(pd: ffi::VkPhysicalDevice) {
 pub struct DevFns {
     pub map_memory: Option<memalias::PFN_map>,
     pub unmap_memory: Option<memalias::PFN_unmap>,
+    pub flush_ranges:
+        Option<unsafe extern "C" fn(ffi::VkDevice, u32, *const ffi::VkMappedMemoryRange) -> i32>,
+    pub invalidate_ranges:
+        Option<unsafe extern "C" fn(ffi::VkDevice, u32, *const ffi::VkMappedMemoryRange) -> i32>,
     pub alloc_memory: Option<memalias::PFN_alloc_mem>,
     pub free_memory: Option<memalias::PFN_free>,
     pub create_buffer:
@@ -312,6 +316,8 @@ impl DevFns {
         DevFns {
             map_memory: None,
             unmap_memory: None,
+            flush_ranges: None,
+            invalidate_ranges: None,
             alloc_memory: None,
             free_memory: None,
             create_buffer: None,
@@ -349,6 +355,16 @@ fn init_dev_fns(device: ffi::VkDevice) -> DevFns {
             driver::resolve_from_get_dev_proc(get_dev, device, c"vkMapMemory");
         fns.unmap_memory =
             driver::resolve_from_get_dev_proc(get_dev, device, c"vkUnmapMemory");
+        fns.flush_ranges = driver::resolve_from_get_dev_proc(
+            get_dev,
+            device,
+            c"vkFlushMappedMemoryRanges",
+        );
+        fns.invalidate_ranges = driver::resolve_from_get_dev_proc(
+            get_dev,
+            device,
+            c"vkInvalidateMappedMemoryRanges",
+        );
         fns.alloc_memory =
             driver::resolve_from_get_dev_proc(get_dev, device, c"vkAllocateMemory");
         fns.free_memory =
