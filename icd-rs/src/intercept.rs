@@ -397,26 +397,23 @@ fn image_is_substituted(image: VkImage) -> bool {
     image_real_entry(image).is_some_and(|(f, _)| f == DEPTH_D32S8)
 }
 
-/// 命令层解析 VkDevice 的兜底来源。
+/// 命令层解析 VkDevice 的来源。
 ///
-/// 优先从 IMAGE_FORMAT_MAP 反查 (D32S8 替换过的图像确实记了 device),
-/// 其次退回到 vkCreateDevice 时锚定的全局 device。这样即使原生 D24S8 应用
-/// (Undertale/D3D9) 不触发任何替换、地图为空, 命令层也能解析到真实函数指针,
-/// 从而**绝不丢弃** vkCmdCopy/Blit/Resolve/ClearDepth 调用 —— 旧实现查不到
-/// 图像就直接 return, 把整条命令吞掉, 正是黑屏根因。
-///
-/// 短路: 本进程从未发生过替换时, 映射表必然为空, image_is_substituted 对全部图像
-/// 恒为 false, 查表结果等价于"查不到"; 此时直接返回全局 device, 跳过 RwLock+HashMap
-/// 查找, 使非 D32S8 游戏的命令层开销≈C 版无钩子。
+/// 直接返回 vkCreateDevice 时锚定的全局 device: 驱动 dispatcher 唯一, 该 device
+/// 在所有场景下都合法, 足以取出真实函数指针。无需按图像反查 IMAGE_FORMAT_MAP ——
+/// 反查分支最终也回退到 global_device, 既冗余又徒增一次 RwLock+HashMap 读取。
+/// 这样 D32S8 游戏的每条 cmd 只保留 image_is_substituted 那一次查表。
+/// 旧实现"查不到图像就 return、吞掉整条命令"正是黑屏根因, 已因 global_device
+/// 恒返回而根除; 非 D32S8 游戏仍由 SUBSTITUTION_HAPPENED 短路完全跳过查表。
 #[inline]
-fn cmd_device(src: VkImage, dst: VkImage) -> Option<VkDevice> {
-    if !substitution_happened() {
-        return crate::global_device();
-    }
-    image_real_entry(src)
-        .or_else(|| image_real_entry(dst))
-        .map(|(_, d)| d)
-        .or_else(crate::global_device)
+fn cmd_device(_src: VkImage, _dst: VkImage) -> Option<VkDevice> {
+    // 命令层只需一个合法 VkDevice 来取真实函数指针。vkCreateDevice 时锚定的
+    // 全局 device 在所有场景下都有效 (驱动 dispatcher 唯一), 故直接返回它,
+    // 无需再按图像反查 IMAGE_FORMAT_MAP —— 反查分支最终也回退到 global_device
+    // (见原 or_else(crate::global_device)), 既冗余又徒增一次 RwLock+HashMap 读取。
+    // 这样 D32S8 游戏的每条 cmd 只保留 image_is_substituted 那一次查表,
+    // 旧实现的"查不到就吞调用"黑屏 bug 已因 global_device 恒返回而根除。
+    crate::global_device()
 }
 
 pub unsafe extern "C" fn shim_create_image(
