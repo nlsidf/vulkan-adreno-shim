@@ -611,7 +611,9 @@ pub unsafe extern "C" fn shim_cmd_clear_depth_stencil_image(
         return;
     };
     // 仅当图像被我们替换成 D24S8 时才需处理。
-    if !raw_test() && image_is_substituted(image) && !p_clear_value.is_null() {
+    // substitution_happened() 是无锁原子 (Relaxed) 短断路: 未发生替换的游戏
+    // (绝大多数) 直接跳过, 免去每次 cmd 的 RwLock 查表, 开销≈C 版无钩子。
+    if !raw_test() && substitution_happened() && image_is_substituted(image) && !p_clear_value.is_null() {
         let cv = &*p_clear_value;
         crate::shim_dbg!(
             "CmdClearDepthStencilImage: 图像={:p} 原 D32S8 clear depth={} stencil={}",
@@ -661,8 +663,11 @@ pub unsafe extern "C" fn shim_cmd_copy_image(
         return;
     };
     // 创建层已统一替换: 所有图像的实际格式一致 (D24S8), 数据布局匹配,
-    // 直接透传。仅防御性诊断记录。
-    if !raw_test() && (image_is_substituted(src_image) || image_is_substituted(dst_image)) {
+    // 直接透传。仅防御性诊断记录。substitution_happened() 短断路见上方 clear。
+    if !raw_test()
+        && substitution_happened()
+        && (image_is_substituted(src_image) || image_is_substituted(dst_image))
+    {
         crate::shim_dbg!(
             "CmdCopyImage: src={:p} dst={:p} (D24S8 同布局, 透传)",
             src_image,
@@ -696,7 +701,10 @@ pub unsafe extern "C" fn shim_cmd_blit_image(
     let Some(real) = crate::dev_fns_global(device).cmd_blit_image else {
         return;
     };
-    if !raw_test() && (image_is_substituted(src_image) || image_is_substituted(dst_image)) {
+    if !raw_test()
+        && substitution_happened()
+        && (image_is_substituted(src_image) || image_is_substituted(dst_image))
+    {
         crate::shim_dbg!(
             "CmdBlitImage: src={:p} dst={:p} (D24S8 同布局, 透传)",
             src_image,
@@ -730,7 +738,10 @@ pub unsafe extern "C" fn shim_cmd_resolve_image(
     let Some(real) = crate::dev_fns_global(device).cmd_resolve_image else {
         return;
     };
-    if !raw_test() && (image_is_substituted(src_image) || image_is_substituted(dst_image)) {
+    if !raw_test()
+        && substitution_happened()
+        && (image_is_substituted(src_image) || image_is_substituted(dst_image))
+    {
         crate::shim_dbg!(
             "CmdResolveImage: src={:p} dst={:p} (D24S8 同布局, 透传)",
             src_image,
