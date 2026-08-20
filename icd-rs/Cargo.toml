@@ -1,7 +1,7 @@
 [package]
 name = "vulkan-adreno-icd"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.2"
+edition = "2024"
 description = "Adreno Vulkan ICD shim (Rust rewrite of icd/vulkan_adreno_icd.c)"
 license = "MIT"
 

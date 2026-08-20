@@ -22,7 +22,7 @@ pub type PFN_vkVoidFunction = Option<unsafe extern "C" fn()>;
 /// 驱动的 dispatcher (与 PFN_vkGetInstanceProcAddr ABI 兼容)。
 pub type AdrenoGetProc = unsafe extern "C" fn(VkInstance, *const c_char) -> PFN_vkVoidFunction;
 
-unsafe fn link_namespaces() {
+unsafe fn link_namespaces() { unsafe {
     type GetNsFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
     type LinkNsFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> bool;
 
@@ -44,10 +44,10 @@ unsafe fn link_namespaces() {
                 libcutils.so:libutils.so:libhardware.so:libnativewindow.so:\
                 libvulkan.so:libvkjson.so:libsync.so";
     link_ns(def, sph, libs.as_ptr());
-}
+}}
 
 /// 加载驱动并解析 dispatcher。失败返回 None (shim 全部入口会随之失效)。
-pub unsafe fn init_driver() -> Option<AdrenoGetProc> {
+pub unsafe fn init_driver() -> Option<AdrenoGetProc> { unsafe {
     link_namespaces();
 
     let drv = cffi::dlopen(ADRENO_VK_DRIVER.as_ptr(), cffi::RTLD_LAZY | cffi::RTLD_GLOBAL);
@@ -75,7 +75,7 @@ pub unsafe fn init_driver() -> Option<AdrenoGetProc> {
 
     let get_proc: AdrenoGetProc = core::mem::transmute(sym);
     Some(get_proc)
-}
+}}
 
 /* ---- 通用解析工具 ---- */
 
@@ -84,22 +84,22 @@ pub unsafe fn resolve_from_get_proc<T: Copy>(
     get_proc: AdrenoGetProc,
     inst: VkInstance,
     name: &CStr,
-) -> Option<T> {
+) -> Option<T> { unsafe {
     let f: PFN_vkVoidFunction = get_proc(inst, name.as_ptr());
     let fp = f?;
     Some(core::mem::transmute_copy::<unsafe extern "C" fn(), T>(&fp))
-}
+}}
 
 /// 从设备 dispatcher (PFN_vkGetDeviceProcAddr) 解析。
 pub unsafe fn resolve_from_get_dev_proc<T: Copy>(
     get_dev: unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction,
     dev: VkDevice,
     name: &CStr,
-) -> Option<T> {
+) -> Option<T> { unsafe {
     let f: PFN_vkVoidFunction = get_dev(dev, name.as_ptr());
     let fp = f?;
     Some(core::mem::transmute_copy::<unsafe extern "C" fn(), T>(&fp))
-}
+}}
 
 /// 把已强转为具体 fn 指针类型的函数转成 PFN_vkVoidFunction (发给 loader / 驱动)。
 /// 调用方必须传入 fn 指针 (8 字节), 不能传零大小的函数项, 否则 transmute_copy 未定义。

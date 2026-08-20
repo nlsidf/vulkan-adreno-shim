@@ -16,7 +16,7 @@ struct IcdHdr {
     size: usize,
 }
 
-unsafe fn icd_raw_alloc(size: usize, alignment: usize) -> *mut c_void {
+unsafe fn icd_raw_alloc(size: usize, alignment: usize) -> *mut c_void { unsafe {
     let alignment = alignment.max(core::mem::size_of::<usize>());
     if alignment & (alignment - 1) != 0 {
         return null_mut(); /* 规范要求 2 的幂 */
@@ -32,24 +32,24 @@ unsafe fn icd_raw_alloc(size: usize, alignment: usize) -> *mut c_void {
     (*h).raw = raw;
     (*h).size = size;
     aligned as *mut c_void
-}
+}}
 
-unsafe extern "C" fn icd_cb_free(_u: *mut c_void, p: *mut c_void) {
+unsafe extern "C" fn icd_cb_free(_u: *mut c_void, p: *mut c_void) { unsafe {
     if p.is_null() {
         return;
     }
     let h = (p as usize - core::mem::size_of::<IcdHdr>()) as *const IcdHdr;
     cffi::free((*h).raw);
-}
+}}
 
 unsafe extern "C" fn icd_cb_alloc(
     _u: *mut c_void,
     size: usize,
     alignment: usize,
     _scope: VkSystemAllocationScope,
-) -> *mut c_void {
+) -> *mut c_void { unsafe {
     icd_raw_alloc(size, alignment)
-}
+}}
 
 unsafe extern "C" fn icd_cb_realloc(
     _u: *mut c_void,
@@ -57,7 +57,7 @@ unsafe extern "C" fn icd_cb_realloc(
     size: usize,
     alignment: usize,
     _scope: VkSystemAllocationScope,
-) -> *mut c_void {
+) -> *mut c_void { unsafe {
     if orig.is_null() {
         return icd_raw_alloc(size, alignment);
     }
@@ -73,7 +73,7 @@ unsafe extern "C" fn icd_cb_realloc(
     core::ptr::copy_nonoverlapping(orig, np, old.min(size));
     icd_cb_free(_u, orig);
     np
-}
+}}
 
 /// 原生 (LP64) VkAllocationCallbacks, 与 C 版 `ICD_NATIVE_ALLOC` 等价。
 pub static HAL_CTX: VkAllocationCallbacks = VkAllocationCallbacks {
