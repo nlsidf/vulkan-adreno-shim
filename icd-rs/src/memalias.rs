@@ -24,9 +24,9 @@ use crate::ffi::*;
 use crate::dev_fns_global;
 use core::ffi::c_int;
 use core::ptr::null_mut;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, Mutex, RwLock};
 
 const MAX_ALIAS: usize = 4096;
 const PAGE: usize = 4096;
@@ -125,8 +125,204 @@ fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
 }
 
-/// 用 hint 直接把 dmabuf 映射到低位 (<4GB)。不用 MAP_FIXED: 高位就 munmap
+/* ---- 低窗地址空间空闲表 (方案一: 用户态分配器, 复用释放的洞) ---- */
+
+/// 低窗记账。key = 洞起始地址, value = 洞长度(字节, 页对齐)。
+/// 已分配的槽不入表。不变量: 一段地址恰在 {空闲表} 或 {ALIAS 的 MemEntry.lo} 之一。
+/// 用 BTreeMap (std, 零依赖, 底层平衡树): 按地址有序 + 合并相邻 API 自然。
+static LOW_FREE: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// 是否启用空闲表复用机制。false => 全程降级走旧盲扫。
+/// 注意: 这里**不**在启动期用 MAP_FIXED 预占整段低窗 —— MAP_FIXED 会静默解除
+/// 该范围内任何既有映射, 而 box64/Wine 的 32 位 guest 内存早就映射在低地址,
+/// 整窗预占会直接 clobber 它们 -> SIGSEGV (9nine/kamiyu 实测崩溃)。故空闲表初始
+/// 为空, 首次分配走内核盲扫挑空闲地址, 仅对我们自己释放的槽做复用 + 重新占位。
+static LOW_WIN_OK: AtomicBool = AtomicBool::new(false);
+
+/// 首次 map 时调用: 仅启用空闲表复用机制, 不做任何 MAP_FIXED 预占 (避免覆盖
+/// box64 既有低地址映射)。空闲表起初为空, 首次分配由 map_low_windowed 降级到
+/// 盲扫放置, 释放后才会有可复用槽。由 LazyLock 保证只执行一次。
+fn ensure_low_window() {
+    if LOW_WIN_OK.load(Ordering::Relaxed) {
+        return;
+    }
+    LOW_WIN_OK.store(true, Ordering::Relaxed);
+    crate::shim_log!(
+        "低位映射空闲表复用已启用 (无整窗预占, 避免覆盖 box64 既有低地址映射)"
+    );
+}
+
+/// 从空闲表挑 best-fit 洞 (size>=len 且 size 最小), 划走后返回起始地址。
+/// 纯内存操作, 不持锁做 syscall。
+fn low_alloc(len: usize) -> Option<usize> {
+    let mut g = LOW_FREE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut best: Option<(usize, usize)> = None;
+    for (&s, &sz) in g.iter() {
+        if sz >= len && (best.is_none() || sz < best.unwrap().1) {
+            best = Some((s, sz));
+        }
+    }
+    let (s, sz) = best?;
+    if sz == len {
+        g.remove(&s);
+    } else {
+        g.remove(&s);
+        g.insert(s + len, sz - len);
+    }
+    Some(s)
+}
+
+/// 把 [lo, lo+len) 还回空闲表并与相邻洞合并。纯内存操作。
+fn low_free(lo: usize, len: usize) {
+    let mut g = LOW_FREE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut start = lo;
+    let mut total = len;
+    /* 连锁合并: 单次前邻/后邻合并后, 合并出的新洞可能又与更远的洞相接,
+     * 故用循环直到前后都无相邻洞。避免连续多个相邻空洞残留成多条条目
+     * (影响地址利用率, 虽不造成功能错误)。 */
+    loop {
+        /* 合并前邻: 最大 start<start 且相接 */
+        let front = g
+            .range(..start)
+            .next_back()
+            .filter(|&(&ps, &psz)| ps + psz == start)
+            .map(|(&ps, &psz)| (ps, psz));
+        if let Some((ps, psz)) = front {
+            start = ps;
+            total += psz;
+            g.remove(&ps);
+        } else {
+            break;
+        }
+    }
+    loop {
+        /* 合并后邻: 紧接 end 的洞 (end 可能因前邻合并改变) */
+        let end = start + total;
+        if let Some(&nsz) = g.get(&end) {
+            total += nsz;
+            g.remove(&end);
+        } else {
+            break;
+        }
+    }
+    g.insert(start, total);
+}
+
+/// 用 MAP_FIXED 把原 dmabuf 映射原地替换为 PROT_NONE 匿名占位: 一次系统调用
+/// 同时完成"解除 dmabuf 映射 + 重新占位"两个动作 (MAP_FIXED 覆盖既有映射是原子的,
+/// 无需先 munmap)。这样该区间内核侧始终被我们占用, 外部 mmap(NULL) 抢不走;
+/// 否则 LOW_FREE 仍记为可用, 后续 low_alloc 把它分给 MAP_FIXED 会静默覆盖别库 -> 崩溃。
+/// 占位失败(极低概率)返回 false, 调用方应跳过 low_free, 避免空闲表记下错误的
+/// "可用" 地址。只占虚拟地址不占物理页, 与窗口预占同机制。
+fn low_reclaim(lo: usize, len: usize) -> bool {
+    let p = unsafe {
+        cffi::mmap(
+            lo as *mut c_void,
+            len,
+            cffi::PROT_NONE,
+            cffi::MAP_FIXED | cffi::MAP_ANONYMOUS | cffi::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if p == cffi::MAP_FAILED {
+        crate::shim_log!("低位洞重新占位失败: lo=0x{:x} len={} (跳过还洞)", lo, len);
+        return false;
+    }
+    true
+}
+
+/// 释放一块低位映射: 用 MAP_FIXED 原子替换为 PROT_NONE 占位并还洞到空闲表。
+/// 若重新占位失败(极低概率), 必须显式 munmap 解除原 dmabuf 映射, 否则映射残留
+/// 造成内存泄漏且地址永久被占; 此时不写空闲表 (地址不确定可用)。供 shim_free_memory
+/// 与 cleanup_device 共用, 保证两处行为一致。
+fn low_release(lo: usize, len: usize) {
+    let rlen = align_up(len, PAGE);
+    if low_reclaim(lo, rlen) {
+        low_free(lo, rlen);
+    } else {
+        crate::shim_log!("低位洞释放: 重新占位失败, 强制 munmap(0x{:x}, {})", lo, rlen);
+        unsafe {
+            cffi::munmap(lo as *mut c_void, rlen);
+        }
+    }
+}
+
+/// 空闲表是否为空 (纯内存操作)。
+fn low_is_empty() -> bool {
+    LOW_FREE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+}
+
+/// 空闲表为空时, 让内核盲扫挑一块空闲低地址 (PROT_NONE 匿名, 绝不 clobber box64
+/// 既有映射), 立即焊死进空闲表, 使后续统一走 low_alloc 复用路径。返回起始地址。
+/// 这样从第一块起所有槽都经自有占位, 释放时由 low_reclaim 重新占位, 全程对外是
+/// 铁板一块, 且 MAP_FIXED 落点永远是我们自己占位的地址 -> 安全。
+fn low_scan_reserve(len: usize) -> Option<usize> {
+    let probe = unsafe {
+        cffi::mmap(
+            null_mut(),
+            len,
+            cffi::PROT_NONE,
+            cffi::MAP_ANONYMOUS | cffi::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if probe == cffi::MAP_FAILED {
+        return None;
+    }
+    let a = probe as usize;
+    /* 内核可能返回 >4GB 地址; 该地址无法给 32 位 guest 用, 且后续 MAP_FIXED
+     * 映射 dmabuf 会失败。必须丢弃 (munmap) 并返回 None, 降级盲扫放置。 */
+    if a + len > 0x1_0000_0000 {
+        unsafe {
+            cffi::munmap(probe, len);
+        }
+        return None;
+    }
+    low_free(a, len); // 入空闲表 (单块时即自身)
+    Some(a)
+}
+
+/// 把 dmabuf fd 映射到 <4GB 的某段低窗槽, 复用空闲表里释放的洞以减少碎片。
+/// 空闲表为空 (首轮分配) 时先盲扫保留一块进表, 之后统一走 low_alloc 复用路径;
+/// 首块起所有槽都是我们自有占位, MAP_FIXED 绝不会 clobber 他人。LOW_WIN_OK=false
+/// 或盲扫也失败则降级 map_low_dmabuf。
+unsafe fn map_low_windowed(fd: i32, size: u64) -> *mut c_void { unsafe {
+    if !LOW_WIN_OK.load(Ordering::Relaxed) {
+        return map_low_dmabuf(fd, size);
+    }
+    let len = align_up(size as usize, PAGE);
+    /* 空闲表空: 盲扫保留一块进表, 使首块也走复用路径 (不 clobber box64) */
+    if low_is_empty() {
+        low_scan_reserve(len);
+    }
+    let Some(slot) = low_alloc(len) else {
+        return map_low_dmabuf(fd, size);
+    };
+    let p = cffi::mmap(
+        slot as *mut c_void,
+        len,
+        cffi::PROT_READ | cffi::PROT_WRITE,
+        cffi::MAP_FIXED | cffi::MAP_SHARED,
+        fd,
+        0,
+    );
+    if p == cffi::MAP_FAILED {
+        /* 落点为我们自有占位, 失败属异常 -> 还回槽, 降级盲扫 */
+        low_free(slot, len);
+        return map_low_dmabuf(fd, size);
+    }
+    p
+}}
+
+/// 降级路径: 用 hint 把 dmabuf 映射到低位 (<4GB)。不用 MAP_FIXED: 高位就 munmap
 /// 换下一个 hint 重试, 避免覆盖并发映射 (内核 4.4 无 MAP_FIXED_NOREPLACE)。
+/// 仅在 LOW_WIN_OK=false 时由 map_low_windowed 调用。
 unsafe fn map_low_dmabuf(fd: i32, size: u64) -> *mut c_void { unsafe {
     let len = align_up(size as usize, PAGE);
     let mut hint = LOW_START;
@@ -467,7 +663,8 @@ unsafe fn setup_low_mapping(device: VkDevice, memory: VkDeviceMemory) -> *mut c_
         return null_mut();
     }
 
-    /* 2) 整块映射到低位 */
+    /* 2) 整块映射到低位 (窗口化空闲表, 复用释放的洞) */
+    ensure_low_window();
     let total = {
         let g = read_alias();
         g.get(&memory).map(|e| e.size).unwrap_or(0)
@@ -475,7 +672,7 @@ unsafe fn setup_low_mapping(device: VkDevice, memory: VkDeviceMemory) -> *mut c_
     if total == 0 {
         return null_mut();
     }
-    let p = map_low_dmabuf(fd, total);
+    let p = map_low_windowed(fd, total);
     if p.is_null() {
         crate::shim_log!(
             "低位映射失败: <4GB 找不到 {}MB 空洞 (fd={})",
@@ -653,7 +850,13 @@ pub unsafe extern "C" fn shim_free_memory(
         }
     }
     if !lo.is_null() {
-        cffi::munmap(lo, len);
+        /* 窗口启用: MAP_FIXED 原子替换为 PROT_NONE 占位 + 还洞 (失败则强制 munmap)。
+         * 未启用窗口(降级盲扫): 无空闲表可还, 仅解除原映射。 */
+        if LOW_WIN_OK.load(Ordering::Relaxed) {
+            low_release(lo as usize, len);
+        } else {
+            cffi::munmap(lo, len);
+        }
     }
     if fd >= 0 {
         cffi::close(fd);
@@ -711,7 +914,13 @@ pub unsafe fn cleanup_device(device: VkDevice) { unsafe {
             }
         }
         if !lo.is_null() {
-            cffi::munmap(lo, len);
+            /* 与 shim_free_memory 一致: 窗口启用走 low_release (占位+还洞,
+             * 失败强制 munmap), 降级盲扫则仅解除原映射。 */
+            if LOW_WIN_OK.load(Ordering::Relaxed) {
+                low_release(lo as usize, len);
+            } else {
+                cffi::munmap(lo, len);
+            }
         }
         if fd >= 0 {
             cffi::close(fd);
