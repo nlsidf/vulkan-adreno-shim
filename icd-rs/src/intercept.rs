@@ -57,7 +57,7 @@ const MAX_PNEXT_NODES: usize = 32;
 /// pNext 精确手术: 重连链, 剔除 (1) 重复 sType 节点 (wine 注入的重复 Features2),
 /// (2) pEnabledFeatures 已设时冗余的 VkPhysicalDeviceFeatures2。其余节点保留。
 /// 返回新的链头。VK_ICD_STRIP_PNEXT=1 时整条剥离 (旧行为, 现场 A/B 用)。
-unsafe fn fix_device_pnext(chain: *const c_void, has_enabled_features: bool) -> *const c_void {
+unsafe fn fix_device_pnext(chain: *const c_void, has_enabled_features: bool) -> *const c_void { unsafe {
     if crate::env_flag(c"VK_ICD_STRIP_PNEXT") {
         crate::shim_log!("VK_ICD_STRIP_PNEXT=1: 整条剥离 pNext");
         return null_mut();
@@ -96,7 +96,7 @@ unsafe fn fix_device_pnext(chain: *const c_void, has_enabled_features: bool) -> 
         crate::shim_log!("pNext 手术: 剔除重复/冗余节点, 新链头 {:p}", head);
     }
     head as *const c_void
-}
+}}
 
 fn ext_in_keep(name: &str) -> bool {
     WSI_KEEP_EXTS.contains(&name)
@@ -195,7 +195,7 @@ pub unsafe extern "C" fn shim_create_instance(
     p_create_info: *const VkInstanceCreateInfo,
     p_allocator: *const VkAllocationCallbacks,
     p_instance: *mut VkInstance,
-) -> i32 {
+) -> i32 { unsafe {
     let Some(real) = crate::real_create_instance() else {
         crate::shim_log!("无法解析真实 vkCreateInstance");
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -223,7 +223,7 @@ pub unsafe extern "C" fn shim_create_instance(
         );
     }
     r
-}
+}}
 
 /* ---- vkEnumeratePhysicalDevices ---- */
 
@@ -231,7 +231,7 @@ pub unsafe extern "C" fn shim_enum_physical_devices(
     instance: VkInstance,
     p_physical_device_count: *mut u32,
     p_physical_devices: *mut VkPhysicalDevice,
-) -> i32 {
+) -> i32 { unsafe {
     let Some(real) = crate::real_enum_pds(instance) else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
@@ -250,7 +250,7 @@ pub unsafe extern "C" fn shim_enum_physical_devices(
         }
     }
     r
-}
+}}
 
 /* ---- vkCreateDevice ---- */
 
@@ -259,12 +259,12 @@ pub unsafe extern "C" fn shim_create_device(
     p_create_info: *const VkDeviceCreateInfo,
     p_allocator: *const VkAllocationCallbacks,
     p_device: *mut VkDevice,
-) -> i32 {
+) -> i32 { unsafe {
     let Some(real) = crate::real_create_device() else {
         crate::shim_log!("无法解析真实 vkCreateDevice");
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let info = unsafe { &*p_create_info };
+    let info = &*p_create_info;
 
     if crate::env_flag(c"VK_ICD_DIAG") {
         crate::shim_log!(
@@ -350,7 +350,7 @@ pub unsafe extern "C" fn shim_create_device(
         }
     );
     r
-}
+}}
 
 /* ---- 深度格式透明替换 D32_SFLOAT_S8_UINT -> D24_UNORM_S8_UINT ---- */
 
@@ -424,11 +424,11 @@ pub unsafe extern "C" fn shim_create_image(
     p_create_info: *const VkImageCreateInfo,
     p_allocator: *const VkAllocationCallbacks,
     p_image: *mut VkImage,
-) -> i32 {
+) -> i32 { unsafe {
     let Some(real) = crate::dev_fns_global(device).create_image else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let info = unsafe { &*p_create_info };
+    let info = &*p_create_info;
     let mut ci = *info;
     // 完美伪装: 应用请求 D32S8 时, 透明替换成硬件真正支持的 D24S8 创建。
     // 仅"原始请求就是 D32S8"的图像才视为被替换 (substituted), 记入映射表供
@@ -437,7 +437,6 @@ pub unsafe extern "C" fn shim_create_image(
     // 对它做多余的伪装处理 -> 黑屏。故必须以"原始请求格式"区分, 与 C 版一致。
     let substituted_d32 = !raw_test() && info.format == DEPTH_D32S8;
     if substituted_d32 {
-        mark_substitution();
         ci.format = DEPTH_D24S8;
         crate::shim_dbg!(
             "D32S8->D24S8 image sub: type={} tiling={} usage=0x{:x} samples={}",
@@ -459,11 +458,15 @@ pub unsafe extern "C" fn shim_create_image(
         let image = *p_image;
         // 仅真正被 D32S8->D24S8 替换的图像记入映射表, 并用 D32S8 作为"被替换"
         // 标记 (原生 D24S8 不记, 命令层据此对它完全透传, 与 C 版行为一致)。
-        if substituted_d32 {
-            if let Ok(mut g) = IMAGE_FORMAT_MAP.write() {
-                g.insert(image, (DEPTH_D32S8, device));
-                crate::shim_dbg!("record image {:p} -> D32S8(sub) (dev {:p})", image, device);
-            }
+        if substituted_d32
+            && let Ok(mut g) = IMAGE_FORMAT_MAP.write()
+        {
+            g.insert(image, (DEPTH_D32S8, device));
+            // 仅在"确实创建成功且已记入映射表"后才置位替换标志,
+            // 避免创建失败时错误标记, 导致后续命令层走查表路径却查不到
+            // 图像 (徒增开销, 虽无害)。
+            mark_substitution();
+            crate::shim_dbg!("record image {:p} -> D32S8(sub) (dev {:p})", image, device);
         }
     }
     if r != VK_SUCCESS {
@@ -478,18 +481,18 @@ pub unsafe extern "C" fn shim_create_image(
         );
     }
     r
-}
+}}
 
 pub unsafe extern "C" fn shim_create_image_view(
     device: VkDevice,
     p_create_info: *const VkImageViewCreateInfo,
     p_allocator: *const VkAllocationCallbacks,
     p_view: *mut VkImageView,
-) -> i32 {
+) -> i32 { unsafe {
     let Some(real) = crate::dev_fns_global(device).create_image_view else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let info = unsafe { &*p_create_info };
+    let info = &*p_create_info;
     let mut ci = *info;
     // 完美伪装: 视图格式同步替换, 与 image 保持一致。
     if !raw_test() && ci.format == DEPTH_D32S8 {
@@ -497,18 +500,18 @@ pub unsafe extern "C" fn shim_create_image_view(
         crate::shim_dbg!("D32S8->D24S8 view sub");
     }
     real(device, &ci, p_allocator, p_view)
-}
+}}
 
 pub unsafe extern "C" fn shim_create_renderpass(
     device: VkDevice,
     p_create_info: *const VkRenderPassCreateInfo,
     p_allocator: *const VkAllocationCallbacks,
     p_render_pass: *mut VkRenderPass,
-) -> i32 {
+) -> i32 { unsafe {
     let Some(real) = crate::dev_fns_global(device).create_renderpass else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let info = unsafe { &*p_create_info };
+    let info = &*p_create_info;
     let mut ci = *info;
     let atts: Vec<VkAttachmentDescription> =
         if !raw_test()
@@ -529,14 +532,14 @@ pub unsafe extern "C" fn shim_create_renderpass(
         };
     let _ = atts;
     real(device, &ci, p_allocator, p_render_pass)
-}
+}}
 
 pub unsafe extern "C" fn shim_create_renderpass2(
     device: VkDevice,
     p_create_info: *const VkRenderPassCreateInfo2,
     p_allocator: *const VkAllocationCallbacks,
     p_render_pass: *mut VkRenderPass,
-) -> i32 {
+) -> i32 { unsafe {
     let fns = crate::dev_fns_global(device);
     let Some(real) = fns
         .create_renderpass2
@@ -544,7 +547,7 @@ pub unsafe extern "C" fn shim_create_renderpass2(
     else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let info = unsafe { &*p_create_info };
+    let info = &*p_create_info;
     let mut ci = *info;
     let atts: Vec<VkAttachmentDescription2> =
         if !raw_test()
@@ -565,7 +568,7 @@ pub unsafe extern "C" fn shim_create_renderpass2(
         };
     let _ = atts;
     real(device, &ci, p_allocator, p_render_pass)
-}
+}}
 
 /* ---- vkDestroyImage: 清理命令层映射表 ---- */
 
@@ -573,16 +576,16 @@ pub unsafe extern "C" fn shim_destroy_image(
     device: VkDevice,
     image: VkImage,
     p_allocator: *const VkAllocationCallbacks,
-) {
-    if !IMAGE_FORMAT_MAP.read().map_or(true, |m| m.is_empty()) {
-        if let Ok(mut g) = IMAGE_FORMAT_MAP.write() {
-            g.remove(&image);
-        }
+) { unsafe {
+    if !IMAGE_FORMAT_MAP.read().map_or(true, |m| m.is_empty())
+        && let Ok(mut g) = IMAGE_FORMAT_MAP.write()
+    {
+        g.remove(&image);
     }
     if let Some(real) = crate::dev_fns_global(device).destroy_image {
         real(device, image, p_allocator);
     }
-}
+}}
 
 /* ---- 命令层拦截 ---- */
 
@@ -602,7 +605,7 @@ pub unsafe extern "C" fn shim_cmd_clear_depth_stencil_image(
     p_clear_value: *const VkClearDepthStencilValue,
     range_count: u32,
     p_ranges: *const VkImageSubresourceRange,
-) {
+) { unsafe {
     let Some(device) = cmd_device(image, image) else {
         // 查不到设备 (理论上不会发生在 device 创建后), 为安全起见直接丢弃以免误用空指针。
         return;
@@ -643,7 +646,7 @@ pub unsafe extern "C" fn shim_cmd_clear_depth_stencil_image(
         range_count,
         p_ranges,
     );
-}
+}}
 
 pub unsafe extern "C" fn shim_cmd_copy_image(
     command_buffer: VkCommandBuffer,
@@ -653,7 +656,7 @@ pub unsafe extern "C" fn shim_cmd_copy_image(
     dst_layout: i32,
     region_count: u32,
     p_regions: *const VkImageCopy,
-) {
+) { unsafe {
     let Some(device) = cmd_device(src_image, dst_image) else {
         return;
     };
@@ -678,7 +681,7 @@ pub unsafe extern "C" fn shim_cmd_copy_image(
         region_count,
         p_regions,
     );
-}
+}}
 
 pub unsafe extern "C" fn shim_cmd_blit_image(
     command_buffer: VkCommandBuffer,
@@ -689,7 +692,7 @@ pub unsafe extern "C" fn shim_cmd_blit_image(
     region_count: u32,
     p_regions: *const VkImageBlit,
     filter: i32,
-) {
+) { unsafe {
     let Some(device) = cmd_device(src_image, dst_image) else {
         return;
     };
@@ -713,7 +716,7 @@ pub unsafe extern "C" fn shim_cmd_blit_image(
         p_regions,
         filter,
     );
-}
+}}
 
 pub unsafe extern "C" fn shim_cmd_resolve_image(
     command_buffer: VkCommandBuffer,
@@ -723,7 +726,7 @@ pub unsafe extern "C" fn shim_cmd_resolve_image(
     dst_layout: i32,
     region_count: u32,
     p_regions: *const VkImageResolve,
-) {
+) { unsafe {
     let Some(device) = cmd_device(src_image, dst_image) else {
         return;
     };
@@ -746,14 +749,14 @@ pub unsafe extern "C" fn shim_cmd_resolve_image(
         region_count,
         p_regions,
     );
-}
+}}
 
 /* ---- vkGetDeviceProcAddr ---- */
 
 pub unsafe extern "C" fn shim_get_device_proc_addr(
     device: VkDevice,
     p_name: *const core::ffi::c_char,
-) -> PFN_vkVoidFunction {
+) -> PFN_vkVoidFunction { unsafe {
     if p_name.is_null() {
         return None;
     }
@@ -808,20 +811,20 @@ pub unsafe extern "C" fn shim_get_device_proc_addr(
         return to_void_fn(shim_destroy_device as PFN_destroy_device);
     }
     get_dev(device, p_name)
-}
+}}
 
 /* ---- vkDestroyDevice (清理 shim 自有的 fd/低位映射/靶子 buffer) ---- */
 
 pub unsafe extern "C" fn shim_destroy_device(
     device: VkDevice,
     p_allocator: *const VkAllocationCallbacks,
-) {
+) { unsafe {
     /* 先释放 shim 记账的资源, 再销毁设备 (HAL 内存对象归应用管) */
     crate::memalias::cleanup_device(device);
     if let Some(real) = crate::dev_fns_global(device).destroy_device {
         real(device, p_allocator);
     }
-}
+}}
 
 use crate::memalias::{
     shim_allocate_memory as memalias_shim_allocate_memory,

@@ -476,7 +476,7 @@ const CRASH_MSG: &[u8] = b"\n[VK_ICD] SIG ";
 const CRASH_MSG2: &[u8] = b" addr 0x";
 const CRASH_MSG3: &[u8] = b"\n";
 
-unsafe extern "C" fn crash_handler(sig: i32, si: *mut cffi::Siginfo, _uc: *mut c_void) {
+unsafe extern "C" fn crash_handler(sig: i32, si: *mut cffi::Siginfo, _uc: *mut c_void) { unsafe {
     let mut buf = [0u8; 64];
     let mut n = 0;
     buf[..CRASH_MSG.len()].copy_from_slice(CRASH_MSG);
@@ -494,7 +494,7 @@ unsafe extern "C" fn crash_handler(sig: i32, si: *mut cffi::Siginfo, _uc: *mut c
     n += CRASH_MSG3.len();
     cffi::write(2, buf.as_ptr() as *const c_void, n);
     cffi::_exit(139);
-}
+}}
 
 fn format_int(buf: &mut [u8], mut v: u32) -> usize {
     let mut tmp = [0u8; 10];
@@ -559,11 +559,11 @@ fn install_crash_handler() {
 
 /* ================= 标准 ICD 入口 ================= */
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
     instance: ffi::VkInstance,
     p_name: *const c_char,
-) -> driver::PFN_vkVoidFunction {
+) -> driver::PFN_vkVoidFunction { unsafe {
     if p_name.is_null() {
         return None;
     }
@@ -600,13 +600,13 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
         return driver::to_void_fn(fmtfix::shim_iffp2 as fmtfix::PFN_iffp2);
     }
     get_proc(instance, p_name)
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
     physical_device: ffi::VkPhysicalDevice,
     p_name: *const c_char,
-) -> driver::PFN_vkVoidFunction {
+) -> driver::PFN_vkVoidFunction { unsafe {
     if p_name.is_null() {
         return None;
     }
@@ -632,4 +632,4 @@ pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
     }
     /* 其余 PD 级函数按 pName 交给驱动 dispatcher */
     get_proc(physical_device as ffi::VkInstance, p_name)
-}
+}}

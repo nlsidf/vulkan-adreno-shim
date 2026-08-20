@@ -126,7 +126,7 @@ fn align_up(v: usize, align: usize) -> usize {
 
 /// 用 hint 直接把 dmabuf 映射到低位 (<4GB)。不用 MAP_FIXED: 高位就 munmap
 /// 换下一个 hint 重试, 避免覆盖并发映射 (内核 4.4 无 MAP_FIXED_NOREPLACE)。
-unsafe fn map_low_dmabuf(fd: i32, size: u64) -> *mut c_void {
+unsafe fn map_low_dmabuf(fd: i32, size: u64) -> *mut c_void { unsafe {
     let len = align_up(size as usize, PAGE);
     let mut hint = LOW_START;
     while hint < LOW_END {
@@ -150,10 +150,10 @@ unsafe fn map_low_dmabuf(fd: i32, size: u64) -> *mut c_void {
         hint += LOW_STEP;
     }
     null_mut()
-}
+}}
 
 /// 导出一次 dmabuf fd (每次 vkGetMemoryFdKHR 都会新建 fd, 必须缓存否则漏光)。
-unsafe fn export_fd(dev: VkDevice, mem: VkDeviceMemory) -> i32 {
+unsafe fn export_fd(dev: VkDevice, mem: VkDeviceMemory) -> i32 { unsafe {
     let Some(get_mem_fd) = dev_fns_global(dev).get_mem_fd else {
         return -1;
     };
@@ -174,7 +174,7 @@ unsafe fn export_fd(dev: VkDevice, mem: VkDeviceMemory) -> i32 {
     } else {
         fd
     }
-}
+}}
 
 fn mem_props() -> &'static VkPhysicalDeviceMemoryProperties {
     crate::mem_props_static()
@@ -194,12 +194,12 @@ pub unsafe extern "C" fn shim_allocate_memory(
     p_allocate_info: *const VkMemoryAllocateInfo,
     p_allocator: *const VkAllocationCallbacks,
     p_memory: *mut VkDeviceMemory,
-) -> i32 {
+) -> i32 { unsafe {
     let fns = crate::dev_fns_global(device);
     let Some(alloc_mem) = fns.alloc_memory else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    let info = unsafe { &*p_allocate_info };
+    let info = &*p_allocate_info;
 
     let ti = info.memory_type_index;
     let props = mem_props();
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn shim_allocate_memory(
         );
     }
     VK_SUCCESS
-}
+}}
 
 /* ---- vkMapMemory ---- */
 
@@ -356,7 +356,7 @@ pub unsafe extern "C" fn shim_map_memory(
     size: u64,
     flags: u32,
     pp_data: *mut *mut c_void,
-) -> i32 {
+) -> i32 { unsafe {
     let fns = crate::dev_fns_global(device);
     let Some(real_map) = fns.map_memory else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -391,30 +391,47 @@ pub unsafe extern "C" fn shim_map_memory(
 
     if lo.is_null() {
         /* 冷路径: 首次建低位映射 (fd/lo 都用 CAS, 无需写锁) */
-        let lo = setup_low_mapping(device, memory);
-        if lo.is_null() {
-            /* 导不出 fd 或低 4GB 无空洞: 把 HAL 高位指针交出去 (比崩强);
-             * 计数保留, 后续 unmap 会配对还回去 */
+        let built = setup_low_mapping(device, memory);
+        if !built.is_null() {
             if !pp_data.is_null() {
-                *pp_data = hi;
+                *pp_data = built.add(offset as usize);
             }
-            return rr;
+            return VK_SUCCESS;
         }
+        /* setup 失败有两种成因:
+         * (a) 真失败 (导不出 fd / 低 4GB 无空洞);
+         * (b) 并发线程抢先 CAS 成功建立 lo, 本线程返回 null。
+         * 对 (b) 必须重新读取 entry 的 lo 复用, 否则会把高位指针交给 32 位
+         * guest (表示不了 -> 崩溃)。仅当 lo 仍为空才退回到 HAL 高位指针。 */
+        let recheck = {
+            let g = read_alias();
+            g.get(&memory)
+                .map(|e| e.lo.load(Ordering::Acquire))
+                .unwrap_or(null_mut())
+        };
+        if !recheck.is_null() {
+            if !pp_data.is_null() {
+                *pp_data = recheck.add(offset as usize);
+            }
+            return VK_SUCCESS;
+        }
+        /* 确实建不出低位映射: 把 HAL 高位指针交出去 (比崩强);
+         * 计数保留, 后续 unmap 会配对还回去 */
         if !pp_data.is_null() {
-            *pp_data = lo.add(offset as usize);
+            *pp_data = hi;
         }
-        return VK_SUCCESS;
+        return rr;
     }
 
     if !pp_data.is_null() {
         *pp_data = lo.add(offset as usize);
     }
     VK_SUCCESS
-}
+}}
 
 /// 首次 map 时建立整块低位映射并挂到 entry (全程原子, 无写锁)。
 /// 返回低位基址; 失败返回 NULL (调用方回退到 HAL 高位指针)。
-unsafe fn setup_low_mapping(device: VkDevice, memory: VkDeviceMemory) -> *mut c_void {
+unsafe fn setup_low_mapping(device: VkDevice, memory: VkDeviceMemory) -> *mut c_void { unsafe {
     /* 1) 取/导出 fd */
     let fd = {
         let g = read_alias();
@@ -489,13 +506,13 @@ unsafe fn setup_low_mapping(device: VkDevice, memory: VkDeviceMemory) -> *mut c_
             null_mut()
         }
     }
-}
+}}
 
 /* ---- vkUnmapMemory ---- */
 
 pub type PFN_unmap = unsafe extern "C" fn(VkDevice, VkDeviceMemory);
 
-pub unsafe extern "C" fn shim_unmap_memory(device: VkDevice, memory: VkDeviceMemory) {
+pub unsafe extern "C" fn shim_unmap_memory(device: VkDevice, memory: VkDeviceMemory) { unsafe {
     let need_real = {
         let g = read_alias();
         match g.get(&memory) {
@@ -508,12 +525,12 @@ pub unsafe extern "C" fn shim_unmap_memory(device: VkDevice, memory: VkDeviceMem
             None => true,
         }
     };
-    if need_real {
-        if let Some(unmap) = crate::dev_fns_global(device).unmap_memory {
-            unmap(device, memory);
-        }
+    if need_real
+        && let Some(unmap) = crate::dev_fns_global(device).unmap_memory
+    {
+        unmap(device, memory);
     }
-}
+}}
 
 /* ---- vkFreeMemory ---- */
 
@@ -523,7 +540,7 @@ pub unsafe extern "C" fn shim_free_memory(
     device: VkDevice,
     memory: VkDeviceMemory,
     p_allocator: *const VkAllocationCallbacks,
-) {
+) { unsafe {
     /* 写锁摘 entry, 把要释放的资源拷贝出来, syscall 全部在锁外 */
     let (target, lo, len, fd, map_count) = {
         let mut g = write_alias();
@@ -547,11 +564,11 @@ pub unsafe extern "C" fn shim_free_memory(
     /* 防御: 应用未 unmap 就 free (DXVK 有此模式)。HAL 的每次 map 都要配对还回去:
      * map_count 可能是多次 vkMapMemory 的累积, 只还一次会漏掉其余 HAL 映射
      * (显存泄漏), 故循环到归零。 */
-    if map_count > 0 {
-        if let Some(unmap) = crate::dev_fns_global(device).unmap_memory {
-            for _ in 0..map_count {
-                unmap(device, memory);
-            }
+    if map_count > 0
+        && let Some(unmap) = crate::dev_fns_global(device).unmap_memory
+    {
+        for _ in 0..map_count {
+            unmap(device, memory);
         }
     }
     if !lo.is_null() {
@@ -563,49 +580,51 @@ pub unsafe extern "C" fn shim_free_memory(
     if let Some(free) = crate::dev_fns_global(device).free_memory {
         free(device, memory, p_allocator);
     }
-    if !target.is_null() {
-        if let Some(destroy) = crate::dev_fns_global(device).destroy_buffer {
-            destroy(device, target, null_mut());
-        }
+    if !target.is_null()
+        && let Some(destroy) = crate::dev_fns_global(device).destroy_buffer
+    {
+        destroy(device, target, null_mut());
     }
-}
+}}
 
 /* ---- vkDestroyDevice 清理 (设备销毁时释放 shim 自有资源) ---- */
 
-pub unsafe fn cleanup_device(device: VkDevice) {
+pub unsafe fn cleanup_device(device: VkDevice) { unsafe {
     let fns = crate::dev_fns_global(device);
+    // 写锁内一次性 drain 掉属于该 device 的全部 entry, 把待释放资源拷贝出来;
+    // syscall (unmap/munmap/close/destroy) 全部在锁外执行。
+    // 这样既不会漏掉"收集期间新插入"的表项 (drain 在持锁内完成),
+    // 也无需先收集后删除两趟遍历。
     let mut victims: Vec<(VkDeviceMemory, VkBuffer, *mut c_void, usize, i32, u32)> = Vec::new();
     {
         let mut g = write_alias();
-        let mut removed = Vec::new();
-        for (mem, e) in g.iter() {
-            if e.dev == device {
+        let drained: Vec<VkDeviceMemory> = g
+            .iter()
+            .filter(|(_, e)| e.dev == device)
+            .map(|(mem, _)| *mem)
+            .collect();
+        for mem in drained {
+            if let Some(e) = g.remove(&mem) {
+                ALIAS_COUNT.fetch_sub(1, Ordering::Relaxed);
                 victims.push((
-                    *mem,
+                    mem,
                     e.buf,
                     e.lo.load(Ordering::Acquire),
                     e.len.load(Ordering::Relaxed),
                     e.fd.load(Ordering::Relaxed),
                     e.hal_map_count.load(Ordering::Relaxed),
                 ));
-                removed.push(*mem);
-            }
-        }
-        for mem in removed {
-            if let Some(e) = g.remove(&mem) {
-                let _ = e;
-                ALIAS_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
     let n = victims.len();
     for (mem, buf, lo, len, fd, map_count) in victims {
         /* 同样把 outstanding 的 HAL map 全部配对还掉, 再清理 shim 自有资源 */
-        if map_count > 0 {
-            if let Some(unmap) = fns.unmap_memory {
-                for _ in 0..map_count {
-                    unmap(device, mem);
-                }
+        if map_count > 0
+            && let Some(unmap) = fns.unmap_memory
+        {
+            for _ in 0..map_count {
+                unmap(device, mem);
             }
         }
         if !lo.is_null() {
@@ -614,14 +633,14 @@ pub unsafe fn cleanup_device(device: VkDevice) {
         if fd >= 0 {
             cffi::close(fd);
         }
-        if !buf.is_null() {
-            if let Some(destroy) = fns.destroy_buffer {
-                destroy(device, buf, null_mut());
-            }
+        if !buf.is_null()
+            && let Some(destroy) = fns.destroy_buffer
+        {
+            destroy(device, buf, null_mut());
         }
     }
     crate::shim_log!("vkDestroyDevice: 已清理 {} 块接管内存", n);
-}
+}}
 
 /* ---- 供测试/诊断查询的统计 ---- */
 

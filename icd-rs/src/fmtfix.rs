@@ -72,7 +72,7 @@ pub fn color_add_rt_attachment(p: &mut VkFormatProperties) {
 
 /* ---- vkGetPhysicalDeviceFormatProperties 修正 ---- */
 
-pub unsafe fn fmtp_fix_depth(pd: VkPhysicalDevice, format: VkFormat, p: *mut VkFormatProperties) {
+pub unsafe fn fmtp_fix_depth(pd: VkPhysicalDevice, format: VkFormat, p: *mut VkFormatProperties) { unsafe {
     if p.is_null() || raw_test() {
         return;
     }
@@ -126,14 +126,14 @@ pub unsafe fn fmtp_fix_depth(pd: VkPhysicalDevice, format: VkFormat, p: *mut VkF
     {
         crate::shim_dbg!("fmtp UNSUPPORTED fmt={}", format);
     }
-}
+}}
 
 /// 顺便修正 pNext 链里的 VkFormatProperties3KHR (2KHR 特性位, 64-bit)。
 ///
 /// 深度/模板 → 补 DEPTH_STENCIL_ATTACHMENT + SAMPLED;
 /// BC 压缩格式 → 补 COLOR_ATTACHMENT + SAMPLED (2KHR 位:
 /// SAMPLED=0x1, COLOR_ATTACHMENT=0x80)。BC 分支同样门控在 `bc_fix()`。
-pub unsafe fn fmtp_fix_depth_pnext(format: VkFormat, p: *mut VkFormatProperties2) {
+pub unsafe fn fmtp_fix_depth_pnext(format: VkFormat, p: *mut VkFormatProperties2) { unsafe {
     if p.is_null() {
         return;
     }
@@ -162,7 +162,7 @@ pub unsafe fn fmtp_fix_depth_pnext(format: VkFormat, p: *mut VkFormatProperties2
             it = (*it).p_next;
         }
     }
-}
+}}
 
 /* ---- vkGetPhysicalDeviceImageFormatProperties ---- */
 
@@ -184,7 +184,7 @@ pub unsafe extern "C" fn shim_iffp(
     usage: u32,
     flags: u32,
     p_properties: *mut VkImageFormatProperties,
-) -> i32 {
+) -> i32 { unsafe {
     ensure_fmtp_resolved(physical_device);
     let Some(iffp) = real_iffp() else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn shim_iffp(
     } else {
         r
     }
-}
+}}
 
 /* ---- vkGetPhysicalDeviceFormatProperties ---- */
 
@@ -263,12 +263,12 @@ pub unsafe extern "C" fn shim_fmtp(
     physical_device: VkPhysicalDevice,
     format: VkFormat,
     p_properties: *mut VkFormatProperties,
-) {
+) { unsafe {
     ensure_fmtp_resolved(physical_device);
     let Some(real) = real_fmtp() else { return };
     real(physical_device, format, p_properties);
     fmtp_fix_depth(physical_device, format, p_properties);
-}
+}}
 
 /* ---- vkGetPhysicalDeviceImageFormatProperties2 (DXVK 实际探测路径) ---- */
 
@@ -282,7 +282,7 @@ pub unsafe extern "C" fn shim_iffp2(
     physical_device: VkPhysicalDevice,
     p_image_format_info: *const VkPhysicalDeviceImageFormatInfo2,
     p_image_format_properties: *mut VkImageFormatProperties2,
-) -> i32 {
+) -> i32 { unsafe {
     ensure_iffp2_resolved(physical_device);
     let Some(iffp2) = real_iffp2() else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -329,7 +329,11 @@ pub unsafe extern "C" fn shim_iffp2(
                 );
                 if rr == VK_SUCCESS {
                     if !p_image_format_properties.is_null() {
-                        *p_image_format_properties = tmp;
+                        // 仅覆盖 image_format_properties 字段, 保留应用挂载在
+                        // 输出结构上的 s_type 与 p_next 扩展链 (整结构体赋会
+                        // 把 s_type/p_next 也覆盖掉, 破坏扩展输出)。
+                        (*p_image_format_properties).image_format_properties =
+                            tmp.image_format_properties;
                     }
                     crate::shim_dbg!(
                         "iffp2 D32S8 伪装为 D24S8 能力: tiling={} usage=0x{:x} -> VK_SUCCESS",
@@ -364,7 +368,7 @@ pub unsafe extern "C" fn shim_iffp2(
         }
     }
     r
-}
+}}
 
 /* ---- vkGetPhysicalDeviceFormatProperties2 ---- */
 
@@ -375,7 +379,7 @@ pub unsafe extern "C" fn shim_fmtp2(
     physical_device: VkPhysicalDevice,
     format: VkFormat,
     p_properties: *mut VkFormatProperties2,
-) {
+) { unsafe {
     if p_properties.is_null() {
         return;
     }
@@ -388,4 +392,4 @@ pub unsafe extern "C" fn shim_fmtp2(
     real(physical_device, format, p_properties);
     fmtp_fix_depth(physical_device, format, &mut (*p_properties).format_properties);
     fmtp_fix_depth_pnext(format, p_properties);
-}
+}}
