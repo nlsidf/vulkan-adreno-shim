@@ -118,10 +118,24 @@ pub const VK_FORMAT_BC6H_SFLOAT_BLOCK: i32 = 144;
 pub const VK_FORMAT_BC7_UNORM_BLOCK: i32 = 145;
 pub const VK_FORMAT_BC7_SRGB_BLOCK: i32 = 146;
 
+/* 标准颜色格式 (权威 vulkan_core.h 值, 注意不要与下表 YUV 冲突) */
+pub const VK_FORMAT_R8G8B8A8_UNORM: i32 = 37;
+pub const VK_FORMAT_B8G8R8A8_UNORM: i32 = 44;
+pub const VK_FORMAT_B8G8R8A8_SRGB: i32 = 43;
+
+/* YUV 视频纹理格式 (DXVK D3D9 视频路径): 权威 vulkan 编号
+   NV12/YV12=多平面420, YUY2/UYVY/打包422 为 100/101/102/103 */
+pub const VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: i32 = 148; /* NV12 */
+pub const VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: i32 = 151; /* YV12 */
+pub const VK_FORMAT_YUYV_422_UNORM: i32 = 100; /* YUY2 */
+pub const VK_FORMAT_UYVY_422_UNORM: i32 = 102; /* UYVY */
+
 /* VkImageUsageFlagBits */
 pub const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
 pub const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
 pub const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x0000_0004;
+pub const VK_IMAGE_USAGE_STORAGE_BIT: u32 = 0x0000_0008;
+pub const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x0000_0010;
 pub const VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT: u32 = 0x0000_0020;
 pub const VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT: u32 = 0x0000_0080;
 
@@ -483,6 +497,15 @@ pub struct VkComponentMapping {
     pub b: i32,
     pub a: i32,
 }
+
+// VkComponentSwizzle
+pub const VK_COMPONENT_SWIZZLE_IDENTITY: i32 = 0;
+pub const VK_COMPONENT_SWIZZLE_ZERO: i32 = 1;
+pub const VK_COMPONENT_SWIZZLE_ONE: i32 = 2;
+pub const VK_COMPONENT_SWIZZLE_R: i32 = 3;
+pub const VK_COMPONENT_SWIZZLE_G: i32 = 4;
+pub const VK_COMPONENT_SWIZZLE_B: i32 = 5;
+pub const VK_COMPONENT_SWIZZLE_A: i32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

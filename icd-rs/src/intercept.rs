@@ -357,6 +357,38 @@ pub unsafe extern "C" fn shim_create_device(
 pub const DEPTH_D32S8: i32 = VK_FORMAT_D32_SFLOAT_S8_UINT;
 pub const DEPTH_D24S8: i32 = VK_FORMAT_D24_UNORM_S8_UINT;
 
+/* ---- kamiyu YUV 转换目标: B8G8R8A8_UNORM -> R8G8B8A8_UNORM ----
+ * Adreno 540 的 storage image 白名单只含 R8G8B8A8_UNORM (fmt 37), 不含
+ * B8G8R8A8_UNORM (fmt 44). DXVK-Sarek 把 NV12/YV12/YUY2/UYVY 转成
+ * B8G8R8A8 + VK_IMAGE_USAGE_STORAGE_BIT (compute 写入目标), GLSL image2D
+ * 是 RGBA8 语义 -> 改写 R8G8B8A8 完全等价且落在硬件白名单内.
+ * 记录被改写过的图像, 使其后续所有 view (STORAGE 写入 + SAMPLED 采样) 也一致改写. */
+pub const BGRA_8888: i32 = VK_FORMAT_B8G8R8A8_UNORM;
+pub const RGBA_8888: i32 = VK_FORMAT_R8G8B8A8_UNORM;
+
+static BGRA_STORAGE_MAP: LazyLock<RwLock<HashMap<VkImage, VkDevice>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static BGRA_STORAGE_HAPPENED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn mark_bgra_storage() {
+    BGRA_STORAGE_HAPPENED.store(true, Ordering::Relaxed);
+}
+
+#[inline]
+fn bgra_storage_happened() -> bool {
+    BGRA_STORAGE_HAPPENED.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn image_is_bgra_storage(image: VkImage) -> bool {
+    if !bgra_storage_happened() {
+        return false;
+    }
+    BGRA_STORAGE_MAP.read().ok().is_some_and(|g| g.contains_key(&image))
+}
+
 /// 命令层一致性表: 记录每个 VkImage 的 *实际* 格式 + 所属设备。
 ///
 /// 在 shim_create_image 中, 若应用请求 D32S8, 我们透明替换为 D24S8 创建,
@@ -443,6 +475,19 @@ pub unsafe extern "C" fn shim_create_image(
             ci.samples
         );
     }
+    // kamiyu: B8G8R8A8 + STORAGE 是 DXVK YUV 转换目标图, Adreno 540 的 storage
+    // 白名单不含 B8G8R8A8, 但含 R8G8B8A8. GLSL image2D 即 RGBA8 语义, 改写等价且
+    // 落在硬件白名单内, 让转换 compute 真正可用 (否则 dispatch 级 UB/黑屏).
+    let bgra_storage = !raw_test()
+        && info.format == BGRA_8888
+        && (info.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+    if bgra_storage {
+        ci.format = RGBA_8888;
+        crate::shim_dbg!(
+            "B8G8R8A8->R8G8B8A8 image sub (kamiyu YUV 转换目标): type={} tiling={} usage=0x{:x}",
+            ci.image_type, ci.tiling, ci.usage
+        );
+    }
     // 诊断: verbose>=2 时记录所有 image 创建格式, 看游戏真实用什么深度格式。
     if crate::verbose() >= 2 {
         crate::shim_dbg!(
@@ -464,6 +509,16 @@ pub unsafe extern "C" fn shim_create_image(
             // 图像 (徒增开销, 虽无害)。
             mark_substitution();
             crate::shim_dbg!("record image {:p} -> D32S8(sub) (dev {:p})", image, device);
+        }
+        // kamiyu: 被 B8G8R8A8->R8G8B8A8 替换的图像记入映射表, 供后续 view 创建
+        // (STORAGE 写入视图 + SAMPLED 采样视图) 同步改写, 保证 image 与所有 view
+        // 格式一致 (否则 view 格式 != image 格式 -> UB).
+        if bgra_storage
+            && let Ok(mut g) = BGRA_STORAGE_MAP.write()
+        {
+            g.insert(image, device);
+            mark_bgra_storage();
+            crate::shim_dbg!("record bgra_storage image {:p} (dev {:p})", image, device);
         }
     }
     if r != VK_SUCCESS {
@@ -495,6 +550,38 @@ pub unsafe extern "C" fn shim_create_image_view(
     if !raw_test() && ci.format == DEPTH_D32S8 {
         ci.format = DEPTH_D24S8;
         crate::shim_dbg!("D32S8->D24S8 view sub");
+    }
+    // kamiyu: 若该视图所属图像是被 B8G8R8A8->R8G8B8A8 替换过的转换目标图,
+    // 其所有 view (STORAGE 写入 + SAMPLED 采样) 都必须同步改写, 保持与 image
+    // 格式一致 (DXVK 对 conversion 图用 ConversionFormatInfo.FormatColor=B8G8R8A8
+    // 创建所有 view, 不区分 usage).
+    if !raw_test() && ci.format == BGRA_8888 && image_is_bgra_storage(ci.image) {
+        ci.format = RGBA_8888;
+        // 颜色修正: compute 仍按 BGRA 语义写 vec4(B,G,R,A), 落到 R8G8B8A8 内存
+        // 后变成 [B][G][R][A]. imageStore 无视 components 映射(只写不读), 故写
+        // 入逻辑不变; 但采样视图读到的物理通道是 R'=原B, G'=原G, B'=原R, A'=原A.
+        // 这里把 components 设为 (B,G,R,A) 交换映射: 采样器输出
+        //   r<-物理B=原R, g<-物理G=原G, b<-物理R=原B, a<-原A
+        // 即还原成正确的 (R,G,B,A). 存储视图只写不读, 此映射对它无副作用.
+        //
+        // 普适性: 仅当 DXVK 传入的 components 为默认值(IDENTITY/全0)时才施加
+        // 交换. 若应用本就设了自定义 swizzle(比如借 BGRA 视图做通道重排), 则保留
+        // 其原意, 不可覆盖, 否则会破坏应用预期的通道映射.
+        let c = ci.components;
+        let is_default = c.r == crate::ffi::VK_COMPONENT_SWIZZLE_IDENTITY
+            && c.g == crate::ffi::VK_COMPONENT_SWIZZLE_IDENTITY
+            && c.b == crate::ffi::VK_COMPONENT_SWIZZLE_IDENTITY
+            && c.a == crate::ffi::VK_COMPONENT_SWIZZLE_IDENTITY;
+        if is_default {
+            ci.components.r = crate::ffi::VK_COMPONENT_SWIZZLE_B;
+            ci.components.g = crate::ffi::VK_COMPONENT_SWIZZLE_G;
+            ci.components.b = crate::ffi::VK_COMPONENT_SWIZZLE_R;
+            ci.components.a = crate::ffi::VK_COMPONENT_SWIZZLE_A;
+            crate::shim_dbg!("B8G8R8A8->R8G8B8A8 view sub (kamiyu YUV 转换目标) + BGRA swap components");
+        } else {
+            crate::shim_dbg!("B8G8R8A8->R8G8B8A8 view sub: 保留应用自定义 components (r={} g={} b={} a={})",
+                c.r, c.g, c.b, c.a);
+        }
     }
     real(device, &ci, p_allocator, p_view)
 }}
@@ -772,6 +859,20 @@ pub unsafe extern "C" fn shim_get_device_proc_addr(
     let fns = crate::dev_fns_global(device);
     let name = core::ffi::CStr::from_ptr(p_name).to_bytes();
 
+    /* 宽口径诊断: 记录 DXVK 经设备 proc addr 解析的所有 Format 相关函数,
+     * 以确认 shim 是否真正拦截到 DXVK 的格式查询路径。 */
+    if name.windows(6).any(|w| w == b"Format") {
+        crate::shim_log!(
+            "DEVPROC name={:?} routed={}",
+            core::str::from_utf8(name).unwrap_or("<bad>"),
+            name == b"vkGetPhysicalDeviceFormatProperties"
+                || name == b"vkGetPhysicalDeviceFormatProperties2"
+                || name == b"vkGetPhysicalDeviceImageFormatProperties"
+                || name == b"vkGetPhysicalDeviceImageFormatProperties2"
+                || name == b"vkGetPhysicalDeviceImageFormatProperties2KHR"
+        );
+    }
+
     if name == b"vkMapMemory" && fns.map_memory.is_some() {
         return to_void_fn(memalias_shim_map_memory as memalias::PFN_map);
     }
@@ -796,6 +897,23 @@ pub unsafe extern "C" fn shim_get_device_proc_addr(
     }
     if name == b"vkCreateImage" && fns.create_image.is_some() {
         return to_void_fn(shim_create_image as PFN_create_image);
+    }
+    /* 格式属性查询也必须经 shim 包裹: 这些是物理设备级函数, 但 DXVK 常经
+     * vkGetDeviceProcAddr 解析, 若不路由则透传真实驱动, shim 的格式修正
+     * (深度/BC/RTV/B8G8R8A8+STORAGE 等) 无从生效。在此一并路由保持一致性。 */
+    if name == b"vkGetPhysicalDeviceFormatProperties" {
+        return to_void_fn(crate::fmtfix::shim_fmtp as crate::fmtfix::PFN_fmtp);
+    }
+    if name == b"vkGetPhysicalDeviceFormatProperties2" {
+        return to_void_fn(crate::fmtfix::shim_fmtp2 as crate::fmtfix::PFN_fmtp2);
+    }
+    if name == b"vkGetPhysicalDeviceImageFormatProperties" {
+        return to_void_fn(crate::fmtfix::shim_iffp as crate::fmtfix::PFN_iffp);
+    }
+    if name == b"vkGetPhysicalDeviceImageFormatProperties2"
+        || name == b"vkGetPhysicalDeviceImageFormatProperties2KHR"
+    {
+        return to_void_fn(crate::fmtfix::shim_iffp2 as crate::fmtfix::PFN_iffp2);
     }
     if name == b"vkCreateImageView" && fns.create_image_view.is_some() {
         return to_void_fn(shim_create_image_view as PFN_create_image_view);

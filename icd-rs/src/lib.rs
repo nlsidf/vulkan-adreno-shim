@@ -75,6 +75,18 @@ pub fn bc_fix() -> bool {
     *BC_FIX.get_or_init(|| env_flag(c"VK_ICD_BC_FIX"))
 }
 
+/// VK_ICD_YUV_FIX=1: 给 YUV 视频格式 (NV12/YV12/YUY2/UYVY) 补 optimal tiling 的
+/// SAMPLED_IMAGE + TRANSFER 能力位。Adreno 540 驱动对这四个格式回报
+/// optimalTilingFeatures=0 (仅 linear 有值), 但实测 vkCreateSamplerYcbcrConversion
+/// 与 vkCreateImage(OPTIMAL) 均返回 VK_SUCCESS —— 硬件 ycbcr 转换本就可用,
+/// 只是能力查询被谎报成 0, 导致 DXVK CheckDeviceFormat 在创建前就拒 (青空下的加缪
+/// OP 视频 "Cannot create texture")。补位后 DXVK 走原生硬件 ycbcr 路径。
+/// 默认关闭, 仅在需要的游戏脚本里显式开启 (见 ycbcr_probe/yuv_fmtp2_probe)。
+static YUV_FIX: OnceLock<bool> = OnceLock::new();
+pub fn yuv_fix() -> bool {
+    *YUV_FIX.get_or_init(|| env_flag(c"VK_ICD_YUV_FIX"))
+}
+
 /// VK_ICD_VERBOSE>=2: 打开热路径诊断 (默认静默, 见 C 版 1f0ff6d)。
 static VERBOSE: OnceLock<i32> = OnceLock::new();
 

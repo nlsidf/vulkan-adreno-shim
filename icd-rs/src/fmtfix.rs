@@ -117,14 +117,6 @@ pub unsafe fn fmtp_fix_depth(pd: VkPhysicalDevice, format: VkFormat, p: *mut VkF
             (*p).optimal_tiling_features
         );
         color_add_rt_attachment(&mut *p);
-        return;
-    }
-    // 诊断: 真实 HAL 报告完全不支持的格式
-    if (40..=220).contains(&format)
-        && (*p).optimal_tiling_features == 0
-        && (*p).linear_tiling_features == 0
-    {
-        crate::shim_dbg!("fmtp UNSUPPORTED fmt={}", format);
     }
 }}
 
@@ -192,6 +184,51 @@ pub unsafe extern "C" fn shim_iffp(
     let r = iffp(physical_device, format, image_type, tiling, usage, flags, p_properties);
     if r == VK_SUCCESS || raw_test() {
         return r;
+    }
+
+    // kamiyu (青空下的加缪) YUV 视频纹理修复:
+    // DXVK-Sarek D3D9 把 NV12/YV12/YUY2/UYVY 经 compute shader 转换成
+    // VK_FORMAT_B8G8R8A8_UNORM + VK_IMAGE_USAGE_STORAGE_BIT (YUV→RGB 写入目标)。
+    // Adreno 540 的 storage image 白名单不含 B8G8R8A8, 但含 R8G8B8A8 (R8G8B8A8
+    // 即是 GLSL image2D 的 RGBA8 语义, 改写等价)。因此这里不直接造值, 而是把
+    // 查询"重定向"到 R8G8B8A8 —— 驱动真实受支持, DXVK CheckImageSupport 拿到
+    // 的是真实能力, 后续 CreateImage/CreateImageView 经 intercept 把 B8G8R8A8
+    // 改写成 R8G8B8A8, 前后一致。条件极窄 (仅 B8G8R8A8+STORAGE), 不影响其它格式。
+    if format == VK_FORMAT_B8G8R8A8_UNORM
+        && (usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0
+        && r == VK_ERROR_FORMAT_NOT_SUPPORTED
+    {
+        if let Some(iffp) = real_iffp() {
+            let rr = iffp(
+                physical_device,
+                VK_FORMAT_R8G8B8A8_UNORM,
+                image_type,
+                tiling,
+                usage,
+                flags,
+                p_properties,
+            );
+            if rr == VK_SUCCESS {
+                crate::shim_dbg!(
+                    "iffp B8G8R8A8+STORAGE 重定向为 R8G8B8A8 查询 (kamiyu YUV 转换目标) -> VK_SUCCESS"
+                );
+                return VK_SUCCESS;
+            }
+        }
+        // 兜底: 万一 R8G8B8A8 也查不到, 退回保守放行 (与 C 版行为一致)。
+        if !p_properties.is_null() {
+            let p = &mut *p_properties;
+            p.max_extent = VkExtent3D { width: 8192, height: 8192, depth: 1 };
+            p.max_mip_levels = 15;
+            p.max_array_layers = 256;
+            p.sample_counts = VK_SAMPLE_COUNT_1_BIT;
+            p.max_resource_size = 0x8000_0000;
+        }
+        crate::shim_dbg!(
+            "iffp B8G8R8A8+STORAGE 兜底放行 (kamiyu YUV 转换目标) tiling={} usage=0x{:x}",
+            tiling, usage
+        );
+        return VK_SUCCESS;
     }
 
     // 深度/模板格式放宽。DXVK 会分别用 DEPTH_STENCIL_ATTACHMENT 与 SAMPLED
@@ -296,6 +333,49 @@ pub unsafe extern "C" fn shim_iffp2(
     let r = iffp2(physical_device, &info, p_image_format_properties);
     if r == VK_SUCCESS || raw_test() {
         return r;
+    }
+
+    // kamiyu (青空下的加缪) YUV 视频纹理修复 (与 v1 iffy 同策略):
+    // DXVK-Sarek 把 NV12/YV12/YUY2/UYVY 转成 B8G8R8A8 + STORAGE_BIT。Adreno 540
+    // 的 storage 白名单不含 B8G8R8A8 但含 R8G8B8A8 (GLSL image2D 即 RGBA8 语义,
+    // 改写等价)。这里把查询重定向到 R8G8B8A8 (驱动真实受支持), 后续
+    // CreateImage/CreateImageView 经 intercept 改写 B8G8R8A8->R8G8B8A8, 前后一致。
+    if info.format == VK_FORMAT_B8G8R8A8_UNORM
+        && (info.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0
+        && r == VK_ERROR_FORMAT_NOT_SUPPORTED
+    {
+        if let Some(iffp2) = real_iffp2() {
+            let redirected = VkPhysicalDeviceImageFormatInfo2 {
+                s_type: info.s_type,
+                p_next: info.p_next,
+                format: VK_FORMAT_R8G8B8A8_UNORM,
+                image_type: info.image_type,
+                tiling: info.tiling,
+                usage: info.usage,
+                flags: info.flags,
+            };
+            let rr = iffp2(physical_device, &redirected, p_image_format_properties);
+            if rr == VK_SUCCESS {
+                crate::shim_dbg!(
+                    "iffp2 B8G8R8A8+STORAGE 重定向为 R8G8B8A8 查询 (kamiyu YUV 转换目标) -> VK_SUCCESS"
+                );
+                return VK_SUCCESS;
+            }
+        }
+        // 兜底: R8G8B8A8 也查不到时保守放行。
+        if !p_image_format_properties.is_null() {
+            let p = &mut (*p_image_format_properties).image_format_properties;
+            p.max_extent = VkExtent3D { width: 8192, height: 8192, depth: 1 };
+            p.max_mip_levels = 15;
+            p.max_array_layers = 256;
+            p.sample_counts = VK_SAMPLE_COUNT_1_BIT;
+            p.max_resource_size = 0x8000_0000;
+            crate::shim_dbg!(
+                "iffp2 B8G8R8A8+STORAGE 兜底放行 (kamiyu YUV 转换目标) tiling={} usage=0x{:x}",
+                info.tiling, info.usage
+            );
+        }
+        return VK_SUCCESS;
     }
 
     // 深度/模板格式放宽 (与 v1 iffy 同策略): DXVK 的 CheckImageSupport 会分别用
